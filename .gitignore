@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+reference/oracle.pt
+build/
+*.so
+*.egg-info/
+.venv/

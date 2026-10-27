@@ -202,3 +202,67 @@ def decode_attention_ref(q: torch.Tensor,
 def swiglu_ref(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """gate, up: [..., intermediate]. Elementwise and memory-bound."""
     return torch.nn.functional.silu(gate) * up
+
+
+# --------------------------------------------------------------------------
+# paged decode attention -- Phase 3 reference, Phase 4 THE kernel
+# --------------------------------------------------------------------------
+
+@register("paged_decode_attention", "ref")
+def paged_decode_attention_ref(q: torch.Tensor,
+                               k_cache: torch.Tensor,
+                               v_cache: torch.Tensor,
+                               block_table: torch.Tensor,
+                               seq_lens: torch.Tensor,
+                               scale: float) -> torch.Tensor:
+    """Paged GQA decode attention. Reference implementation.
+
+    q:           [B, n_q_heads, head_dim]
+    k_cache:     [num_blocks, n_kv_heads, block_size, head_dim]  (v same)
+    block_table: [B, max_blocks_per_seq]  int32, -1 for unallocated
+    seq_lens:    [B]                      int32, valid tokens per sequence
+    returns:     [B, n_q_heads, head_dim]
+
+    This is a SEPARATE op name rather than another impl of
+    "decode_attention" because the signature genuinely differs -- a block
+    table has no analogue in the contiguous version. Keeping both registered
+    means Phase 3 can run either and diff them, which is how the block
+    mapping gets validated.
+
+    DELIBERATELY SLOW: it loops over sequences in Python and gathers each
+    one's blocks. Phase 3 validates the data layout, not throughput, and a
+    per-sequence loop keeps the memory cost O(seq_len) instead of
+    materialising the whole cache. The Phase 4 kernel's entire job is to do
+    this without the gather.
+    """
+    B, n_q, d = q.shape
+    _, n_kv, block_size, _ = k_cache.shape
+    G = n_q // n_kv
+    out = torch.empty(B, n_q, d, dtype=q.dtype, device=q.device)
+
+    for b in range(B):
+        n = int(seq_lens[b])
+        if n == 0:
+            out[b].zero_()
+            continue
+        nb = (n + block_size - 1) // block_size
+        blocks = block_table[b, :nb].long()
+        if bool((blocks < 0).any()):
+            raise RuntimeError(f"seq {b} has {n} tokens but an unallocated block")
+
+        # [nb, n_kv, block_size, d] -> [nb*block_size, n_kv, d] -> trim to n
+        def pull(cache):
+            return (cache[blocks].permute(0, 2, 1, 3)
+                    .reshape(nb * block_size, n_kv, d)[:n])
+
+        k = pull(k_cache).float()                    # [n, n_kv, d]
+        v = pull(v_cache).float()
+
+        # Group queries instead of expanding KV, same as decode_attention_ref:
+        # query head k*G+g reads KV head k.
+        qg = q[b].view(n_kv, G, d).float()           # [n_kv, G, d]
+        scores = torch.einsum("kgd,nkd->kgn", qg, k) * scale
+        probs = torch.softmax(scores, dim=-1)
+        out[b] = torch.einsum("kgn,nkd->kgd", probs, v).reshape(n_q, d).to(q.dtype)
+
+    return out

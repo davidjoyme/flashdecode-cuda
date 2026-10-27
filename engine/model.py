@@ -68,18 +68,26 @@ import torch.nn.functional as F
 from config import LlamaConfig
 from engine import ops
 from engine.cache import ContiguousKVCache
+from engine.paged_cache import PagedKVCache
 
 
 class LlamaEngine:
     def __init__(self, cfg: LlamaConfig, weights: Dict[str, torch.Tensor],
-                 device="cuda", dtype=torch.bfloat16):
+                 device="cuda", dtype=torch.bfloat16, rope_max_pos: int = 8192):
         self.cfg = cfg
         self.device = device
         self.dtype = dtype
         self.w = weights
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
+        # Cap the rope tables. Qwen2.5 advertises max_position_embeddings =
+        # 131072, which builds two [131072, 128] fp32 tables = 134 MB of VRAM
+        # for positions no benchmark here ever reaches. Capping at 8192 costs
+        # 8.4 MB and frees 126 MB, which matters on a shared card. Raise this
+        # if you ever benchmark beyond 8k context -- positions past the table
+        # would index out of bounds rather than silently wrap.
+        self.rope_max_pos = min(rope_max_pos, cfg.max_position_embeddings)
         self.cos, self.sin = ops.build_rope_cache(
-            cfg.head_dim, cfg.max_position_embeddings,
+            cfg.head_dim, self.rope_max_pos,
             cfg.rope_theta, cfg.rope_scaling, device)
         # Resolve biases once. None for Llama, tensors for Qwen2.
         self.qb = [self._bias(i, "q_proj") for i in range(cfg.num_hidden_layers)]
@@ -104,6 +112,32 @@ class LlamaEngine:
                                  self.cfg.num_key_value_heads, self.cfg.head_dim,
                                  self.dtype, self.device)
 
+    def new_paged_cache(self, batch_size: int, max_len: int,
+                        block_size: int = 16, slack_blocks: int = 8) -> PagedKVCache:
+        """Paged cache sized for `batch_size` sequences of up to `max_len`.
+
+        slack_blocks is spare capacity in the pool beyond the worst case, so a
+        sequence crossing a block boundary mid-run does not hit MemoryError.
+        With every sequence at max_len there is nothing to reclaim, so the
+        pool must be provisioned for the worst case -- paging buys memory back
+        on RAGGED workloads, not on a uniform full-length batch. Worth being
+        precise about in the writeup: the win is admitting more sequences when
+        lengths vary, not shrinking a fixed benchmark.
+        """
+        per_seq = (max_len + block_size - 1) // block_size
+        cache = PagedKVCache(
+            self.cfg.num_hidden_layers, self.cfg.num_key_value_heads,
+            self.cfg.head_dim, num_blocks=per_seq * batch_size + slack_blocks,
+            max_seqs=batch_size, max_blocks_per_seq=per_seq + 2,
+            block_size=block_size, dtype=self.dtype, device=self.device)
+        for b in range(batch_size):
+            cache.add_sequence(b, 0)
+        return cache
+
+    @staticmethod
+    def _is_paged(cache) -> bool:
+        return isinstance(cache, PagedKVCache)
+
     # ------------------------------------------------------------------
     def prefill(self, input_ids: torch.Tensor, cache: ContiguousKVCache,
                 logits_all: bool = False) -> torch.Tensor:
@@ -125,6 +159,10 @@ class LlamaEngine:
         (at ctx=4096 that is ~1.2 GB for a 152k vocab)."""
         cfg = self.cfg
         B, S = input_ids.shape
+        paged = self._is_paged(cache)
+        if paged:
+            # Reserve the prompt's blocks once, before any layer writes.
+            cache.ensure_capacity(extra=S)
         h = F.embedding(input_ids, self._w("model.embed_tokens.weight"))
         self._rec("embed", h)
 
@@ -203,6 +241,17 @@ class LlamaEngine:
         """
         cfg = self.cfg
         B = token.shape[0]
+        paged = self._is_paged(cache)
+        if paged:
+            # ONCE per step, before the layer loop. A sequence needs a new
+            # block at most once per step, while append() runs once per layer
+            # -- folding allocation into append would do 28x the work and
+            # would run the Python-side allocator inside the hot loop.
+            cache.ensure_capacity()
+            # active_view() gathers rows of the block table, so hoist it too.
+            block_table, slens = cache.active_view()
+            attend_lens = slens + 1     # the token written this step counts
+
         h = F.embedding(token, self._w("model.embed_tokens.weight"))
 
         positions = cache.positions                     # [B]
@@ -231,10 +280,14 @@ class LlamaEngine:
             q, k = ops.call("rope", q, k, cos, sin)
             cache.append(i, k, v)
 
-            k_cache, v_cache = cache.layer(i)
-            # seq_lens + 1: the token just written is attendable this step.
-            attn = ops.call("decode_attention", q, k_cache, v_cache,
-                            cache.seq_lens + 1, self.scale)      # [B, n_q, d]
+            if paged:
+                attn = ops.call("paged_decode_attention", q, cache.k[i], cache.v[i],
+                                block_table, attend_lens, self.scale)
+            else:
+                k_cache, v_cache = cache.layer(i)
+                # seq_lens + 1: the token just written is attendable this step.
+                attn = ops.call("decode_attention", q, k_cache, v_cache,
+                                cache.seq_lens + 1, self.scale)  # [B, n_q, d]
 
             h = F.linear(attn.reshape(B, -1),
                          self._w(f"{p}.self_attn.o_proj.weight"))

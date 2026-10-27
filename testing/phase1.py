@@ -159,9 +159,21 @@ def stage_diff_and_parity(oracle):
     eng = LlamaEngine(cfg, weights, config.DEVICE, config.DTYPE)
     ids = oracle["input_ids"].to(config.DEVICE)
     max_len = ids.shape[1] + config.PARITY_MAX_NEW_TOKENS + 8
-    cache = ContiguousKVCache(cfg.num_hidden_layers, ids.shape[0], max_len,
-                              cfg.num_key_value_heads, cfg.head_dim,
-                              config.DTYPE, config.DEVICE)
+
+    # FD_CACHE=paged runs the whole gate against the paged cache. The paged
+    # path must be BIT-EXACT against HuggingFace, not merely close: the KV
+    # values are identical, only their addresses differ, so any difference is
+    # an indexing bug rather than a numerical one.
+    kind = os.environ.get("FD_CACHE", "contiguous")
+    if kind == "paged":
+        bs = int(os.environ.get("FD_BLOCK_SIZE", "16"))
+        cache = eng.new_paged_cache(ids.shape[0], max_len, block_size=bs)
+        print(f"  cache: paged, block_size={bs}")
+    else:
+        cache = ContiguousKVCache(cfg.num_hidden_layers, ids.shape[0], max_len,
+                                  cfg.num_key_value_heads, cfg.head_dim,
+                                  config.DTYPE, config.DEVICE)
+        print("  cache: contiguous")
 
     # Run the gate for EVERY implementation, not just the reference.
     #
@@ -189,6 +201,13 @@ def stage_diff_and_parity(oracle):
         _hdr(3, f"activation diff vs HuggingFace -- {impl}")
         print(f"  {cfg.summary()}")
         print(f"  ops: {desc}\n")
+
+        # Reset between implementations. The previous impl's prefill and
+        # generate left seq_lens > 0, and append_prefill asserts the cache is
+        # empty -- correctly, since prefilling over existing history would
+        # silently compare against the wrong KV. Each impl must see the same
+        # starting state or the comparison means nothing.
+        cache.reset()
 
         eng.trace = {}
         with torch.inference_mode():
@@ -237,6 +256,15 @@ def stage_diff_and_parity(oracle):
 def _fill_cache(eng, cfg, B, ctx):
     """Put the cache into the state a decode step at (B, ctx) would see,
     without running a prefill. Timing only."""
+    if os.environ.get("FD_CACHE") == "paged":
+        bs = int(os.environ.get("FD_BLOCK_SIZE", "16"))
+        cache = eng.new_paged_cache(B, ctx + 40, block_size=bs)
+        cache.ensure_capacity(extra=ctx)
+        for i in range(cfg.num_hidden_layers):
+            cache.k[i].normal_(0, 0.5)
+            cache.v[i].normal_(0, 0.5)
+        cache.seq_lens[:B] = ctx
+        return cache
     cache = eng.new_cache(B, ctx + 40)
     for i in range(cfg.num_hidden_layers):
         k, v = cache.layer(i)
@@ -417,6 +445,70 @@ def stage_baseline(cfg, eng, shapes, impls=("ref", "cuda"), steps=24) -> dict:
     return dict(sorted(results.items()))
 
 
+# ---------------------------------------------------------------- shapes
+# A FIXED core set plus one opportunistic large shape.
+#
+# The core exists for comparability: if the shape list changed with whatever
+# memory happened to be free, two runs could not be compared and the log
+# would be worthless. These four are small enough to fit even on a busy card
+# and are the rows that belong in logs/EXPERIMENTS.md.
+#
+# ctx=2048 rather than 4096 at double the batch. KV% is set by B*ctx (total
+# tokens), so memory cost and KV share of traffic are identical either way --
+# but twice as many SEQUENCES means twice the grid for the Phase 4 decode
+# kernel, which launches on the order of B * n_kv_heads blocks and was
+# occupancy-starved at 0.09 waves/SM in Phase 2. More sequences is exactly
+# the lever that matters.
+CORE_SHAPES = [(1, 2048), (64, 2048), (128, 2048), (64, 4096)]
+
+# Candidate large shapes, tried biggest-first; the first one that fits in the
+# current budget is appended. On a busy card none fit and the core still
+# runs; on an idle card this reaches the real ceiling without editing code.
+STRETCH_SHAPES = [(512, 2048), (384, 2048), (256, 2048), (192, 2048),
+                  (256, 4096), (192, 4096), (160, 2048)]
+
+
+def choose_shapes(cfg) -> list:
+    """Core shapes that fit, plus the largest stretch shape that fits.
+
+    Override with FD_SHAPES="64x2048,128x2048" to pin an exact list.
+    """
+    override = os.environ.get("FD_SHAPES")
+    if override:
+        out = []
+        for tok in override.split(","):
+            b, c = tok.strip().lower().split("x")
+            out.append((int(b), int(c)))
+        print(f"\n  FD_SHAPES override: {out}")
+        return out
+
+    per_tok = 2 * cfg.num_key_value_heads * cfg.head_dim * 2 * cfg.num_hidden_layers
+    free, total = torch.cuda.mem_get_info()
+    budget = free * 0.85
+
+    def fits(shape) -> bool:
+        B, c = shape
+        # 1.25x covers the reference attention's fp32 upcast of one layer's KV.
+        return B * c * per_tok * 1.25 < budget
+
+    core = [s for s in CORE_SHAPES if fits(s)]
+    dropped = [s for s in CORE_SHAPES if s not in core]
+    stretch = next((s for s in STRETCH_SHAPES if fits(s)), None)
+
+    print(f"\n  {free/1e9:.1f} of {total/1e9:.1f} GB free "
+          f"-> budget {budget/1e9:.1f} GB, KV {per_tok/1024:.1f} KB/token")
+    if dropped:
+        print(f"  core shapes that will not fit right now: {dropped}")
+        print("  (they are the comparable rows -- re-run these when the card frees up)")
+    if stretch:
+        print(f"  stretch shape that fits: {stretch}")
+    shapes = core + ([stretch] if stretch and stretch not in core else [])
+    if not shapes:
+        print("  nothing fits; falling back to B=1 so the run still produces a row")
+        shapes = [(1, 1024)]
+    return shapes
+
+
 # ---------------------------------------------------------------- main
 def main() -> int:
     print("Phase 1 gate")
@@ -449,6 +541,9 @@ def main() -> int:
     except Exception:
         traceback.print_exc()
         print("\n  Stage 3/4 crashed. Most likely causes, in order:")
+        print("    0. 'prefill into a non-empty cache' -- the cache was not")
+        print("       reset between the ref and cuda passes. cache.reset()")
+        print("       belongs at the top of the per-impl loop.")
         print("    1. qkv_bias -- Qwen2 has biases on q/k/v_proj. loader.load()")
         print("       detects them from the checkpoint; if cfg.qkv_bias printed")
         print("       'no' above for a Qwen model, that detection failed.")
@@ -463,7 +558,7 @@ def main() -> int:
 
     # Shapes chosen from the VRAM budget: Qwen2.5-1.5B weights are ~3.1 GB,
     # leaving ~28 GB for KV, which caps ctx=4096 at roughly B=238.
-    shapes = [(1, 1024), (1, 4096), (32, 4096), (64, 4096), (128, 4096), (200, 4096)]
+    shapes = choose_shapes(cfg)
 
     only = os.environ.get("FD_IMPL")
     impls = (only,) if only in ("ref", "cuda") else ("ref", "cuda")

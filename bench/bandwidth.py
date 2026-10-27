@@ -13,7 +13,6 @@ change GPUs; a thermally throttled card reads ~10% low.
 """
 
 from __future__ import annotations
-
 import torch
 
 

@@ -1,18 +1,13 @@
 """
-The op boundary.
+The op boundary. UNCHANGED by the Qwen switch.
 
-The load-bearing architectural decision. Every operation destined to become a
-CUDA kernel lives here as a pure-PyTorch reference with a FROZEN signature.
-Model code calls ops.call(name, ...) and never an implementation directly.
+Qwen2 uses the same RMSNorm, the same rotate_half RoPE convention, the same
+SwiGLU and the same attention maths as Llama. The only delta is the QKV bias,
+which lives in the projections (model.py), not in any of these ops.
 
-Consequences:
-  - Landing a kernel is ops.use("rmsnorm", "cuda") -- model code untouched.
-  - You can run any MIX of reference and custom kernels, so a correctness bug
-    bisects to one kernel in minutes instead of days.
-  - Signatures are shaped for what a kernel wants (flat, contiguous, explicit
-    dims), not for what reads nicely in PyTorch. Decode ops take
-    [B, heads, head_dim] with no sequence axis, because that is all a decode
-    kernel ever sees.
+Every operation destined to become a CUDA kernel lives here as a pure-PyTorch
+reference with a FROZEN signature. Model code calls ops.call(name, ...) and
+never an implementation directly.
 """
 
 from __future__ import annotations
@@ -21,10 +16,6 @@ import math
 from typing import Callable, Dict, Optional
 
 import torch
-
-# --------------------------------------------------------------------------
-# Registry
-# --------------------------------------------------------------------------
 
 _IMPL: Dict[str, str] = {}
 _REGISTRY: Dict[str, Dict[str, Callable]] = {}
@@ -45,7 +36,6 @@ def use(op: str, impl: str) -> None:
 
 
 def use_all(impl: str) -> None:
-    """Switch every op that has this impl. Ops without it stay on ref."""
     for op, impls in _REGISTRY.items():
         if impl in impls:
             _IMPL[op] = impl
@@ -72,10 +62,8 @@ def call(op: str, *args, **kwargs):
 def rmsnorm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """x: [..., hidden]   weight: [hidden]
 
-    Order of operations matters and must match HF exactly: variance in fp32,
-    scale in fp32, cast BACK to input dtype, and only then multiply by the
-    weight. Doing the weight multiply in fp32 gives a slightly different
-    answer that shows up as a small persistent diff in the parity harness.
+    Order of operations must match HF exactly: variance in fp32, scale in
+    fp32, cast BACK to input dtype, and only then multiply by the weight.
     """
     in_dtype = x.dtype
     x32 = x.to(torch.float32)
@@ -86,18 +74,13 @@ def rmsnorm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tens
 
 @register("rmsnorm_residual", "ref")
 def rmsnorm_residual_ref(x, residual, weight, eps):
-    """Fused pattern: h = x + residual; returns (rmsnorm(h), h).
-
-    Returns BOTH because the fused kernel writes both in one pass. Keeping
-    this signature from day one means the kernel drops in without touching
-    model.py.
-    """
+    """Fused pattern: h = x + residual; returns (rmsnorm(h), h)."""
     h = x + residual
     return rmsnorm_ref(h, weight, eps), h
 
 
 # --------------------------------------------------------------------------
-# rope -- Phase 5 target (fused rope + kv write)
+# rope -- Phase 5 target
 # --------------------------------------------------------------------------
 
 def build_rope_cache(head_dim: int, max_pos: int, theta: float,
@@ -105,11 +88,16 @@ def build_rope_cache(head_dim: int, max_pos: int, theta: float,
     """Precompute cos/sin tables: [max_pos, head_dim].
 
     cat((freqs, freqs)) is the HF 'rotate_half' convention -- pairs element i
-    with i + head_dim/2. This is NOT the interleaved convention (i with i+1)
-    used in the original Llama repo and in many CUDA implementations. Getting
-    it wrong produces output that is grammatical but subtly wrong, which is
-    the worst failure mode. If layer 0 diffs small and layer 31 is garbage,
-    suspect this first.
+    with i + head_dim/2, NOT the interleaved convention (i with i+1).
+
+    Qwen2.5-1.5B: rope_theta=1000000.0, no rope_scaling. The large theta is
+    the only numeric difference from Llama here and needs no code change,
+    since theta comes from config.json.
+
+    max_pos note: Qwen2.5 advertises max_position_embeddings=131072, so this
+    table would be 131072 x 128 fp32 x 2 = 134 MB. The caller should pass a
+    smaller max_pos for benchmarking; see LlamaEngine.__init__ if that becomes
+    a problem.
     """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
 
@@ -117,19 +105,14 @@ def build_rope_cache(head_dim: int, max_pos: int, theta: float,
         inv_freq = _llama3_scaling(inv_freq, scaling)
 
     t = torch.arange(max_pos, device=device).float()
-    freqs = torch.outer(t, inv_freq)                 # [max_pos, head_dim/2]
-    emb = torch.cat((freqs, freqs), dim=-1)          # [max_pos, head_dim]
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
 def _llama3_scaling(inv_freq: torch.Tensor, scaling: dict) -> torch.Tensor:
-    """Llama 3.1/3.2 NTK-style frequency scaling.
-
-    Llama-3.2-1B ships with this; Llama-3-8B does not. Skipping it on a model
-    that needs it leaves short-prompt output fine and long-context output
-    degraded -- a silent failure the parity test catches only if you test long
-    prompts. Test long prompts.
-    """
+    """Llama 3.1/3.2 NTK-style frequency scaling. Not used by Qwen2.5, kept
+    so a Llama checkpoint still works if you switch back."""
     factor = scaling["factor"]
     low_f = scaling["low_freq_factor"]
     high_f = scaling["high_freq_factor"]
@@ -155,12 +138,8 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def rope_ref(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """Decode-shaped RoPE.
 
-    q:   [B, n_q_heads, head_dim]
-    k:   [B, n_kv_heads, head_dim]
+    q: [B, n_q_heads, head_dim]   k: [B, n_kv_heads, head_dim]
     cos/sin: [B, head_dim] -- already gathered at each sequence's position
-
-    No sequence axis, deliberately: one token per sequence is all the decode
-    kernel ever sees.
     """
     c = cos.unsqueeze(1).to(q.dtype)
     s = sin.unsqueeze(1).to(q.dtype)
@@ -183,28 +162,36 @@ def decode_attention_ref(q: torch.Tensor,
     k_cache:  [B, max_len, n_kv_heads, head_dim]   (v_cache same)
     seq_lens: [B]  number of VALID cache entries per sequence
     returns:  [B, n_q_heads, head_dim]
-
-    Phase 3 replaces this with a paged variant taking a block table. That
-    signature change is why paged gets its own op name rather than being
-    another impl of this one.
     """
     B, n_q, d = q.shape
     _, max_len, n_kv, _ = k_cache.shape
-    groups = n_q // n_kv
+    G = n_q // n_kv
 
-    # repeat_interleave materialises a full copy of the cache. That is
-    # exactly the bandwidth waste the Phase 4 v3 kernel eliminates by loading
-    # each KV head once and reusing it across its query group.
-    k = k_cache.repeat_interleave(groups, dim=2).permute(0, 2, 1, 3)   # [B,n_q,max_len,d]
-    v = v_cache.repeat_interleave(groups, dim=2).permute(0, 2, 1, 3)
+    # GROUP THE QUERIES instead of expanding the KV cache.
+    #
+    # The obvious implementation is k_cache.repeat_interleave(G, dim=2)
+    # followed by .float(). That materialises a transient of
+    # B * n_q * max_len * d * 4 bytes -- G times too big from the expansion
+    # and another 2x from the fp32 upcast, so 12x the real KV footprint at
+    # Qwen2.5-1.5B's GQA group of 6. At B=128 ctx=4096 that is a single
+    # 3.25 GB allocation and it OOMs a 32 GB card, which is exactly what
+    # capped the Phase 1 baseline at B=64.
+    #
+    # Viewing q as [B, n_kv, G, d] gives the same head mapping for free:
+    # query head k*G+g lands at [k, g], and k*G+g // G == k, which is the
+    # repeat_interleave mapping. Verified bitwise identical to the expanding
+    # version, and it is also what the Phase 4 v3 kernel does -- load each KV
+    # head once, reuse it across its query group.
+    qg = q.view(B, n_kv, G, d).float()
 
-    scores = torch.einsum("bhd,bhld->bhl", q.float(), k.float()) * scale
+    scores = torch.einsum("bkgd,blkd->bkgl", qg, k_cache.float()) * scale
 
-    pos = torch.arange(max_len, device=q.device).view(1, 1, max_len)
-    scores = scores.masked_fill(pos >= seq_lens.view(B, 1, 1), float("-inf"))
+    pos = torch.arange(max_len, device=q.device).view(1, 1, 1, max_len)
+    scores = scores.masked_fill(pos >= seq_lens.view(B, 1, 1, 1), float("-inf"))
 
     probs = torch.softmax(scores, dim=-1)
-    return torch.einsum("bhl,bhld->bhd", probs, v.float()).to(q.dtype)
+    out = torch.einsum("bkgl,blkd->bkgd", probs, v_cache.float())
+    return out.reshape(B, n_q, d).to(q.dtype)
 
 
 # --------------------------------------------------------------------------
@@ -213,6 +200,5 @@ def decode_attention_ref(q: torch.Tensor,
 
 @register("swiglu", "ref")
 def swiglu_ref(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """gate, up: [..., intermediate]. Elementwise and memory-bound -- a good
-    second kernel after rmsnorm."""
+    """gate, up: [..., intermediate]. Elementwise and memory-bound."""
     return torch.nn.functional.silu(gate) * up

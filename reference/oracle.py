@@ -11,12 +11,9 @@ Run once; regenerate only when MODEL_ID or PARITY_PROMPT changes.
 """
 
 from __future__ import annotations
-
 import os
 from typing import Dict
-
 import torch
-
 import config
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oracle.pt")

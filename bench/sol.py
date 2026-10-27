@@ -16,9 +16,7 @@ Decode is a memory problem wearing a matmul costume.
 """
 
 from __future__ import annotations
-
 import argparse
-
 from config import LlamaConfig
 
 

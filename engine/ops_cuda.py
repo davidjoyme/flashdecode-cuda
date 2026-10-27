@@ -97,6 +97,13 @@ if AVAILABLE:
                                     seq_lens, scale):
         """Same signature as ops.paged_decode_attention_ref.
 
+        FD_ATTN_VERSION picks the kernel, default 2:
+          0  one warp per query head, scalar loads, whole context per block
+          1  thread groups + 16-byte vectorised loads
+          2  v1 plus split-KV across blocks, with a combine pass
+        FD_ATTN_SPLITS overrides v2's split count (0 = auto). All three stay
+        compiled, so before/after comes from one binary on one dataset.
+
         The reference loops over sequences in Python and gathers each one's
         blocks; this reads the cache in place. Note seq_lens must be int32 --
         the engine passes `slens + 1`, which keeps the dtype, but a caller
@@ -106,4 +113,6 @@ if AVAILABLE:
         return fd_kernels.paged_decode_attention(
             q.contiguous(), k_cache.contiguous(), v_cache.contiguous(),
             block_table.contiguous().to(torch.int32),
-            seq_lens.contiguous().to(torch.int32), float(scale))
+            seq_lens.contiguous().to(torch.int32), float(scale),
+            int(os.environ.get("FD_ATTN_VERSION", "2")),
+            int(os.environ.get("FD_ATTN_SPLITS", "0")))

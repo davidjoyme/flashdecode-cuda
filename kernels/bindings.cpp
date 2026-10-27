@@ -70,14 +70,20 @@ bool paged_decode_attention_launch(
         const bf16 *q, const bf16 *k_cache, const bf16 *v_cache,
         const int *block_table, const int *seq_lens, bf16 *out,
         int batch, int n_kv_heads, int group, int head_dim,
-        int block_size, int max_blocks, float scale, cudaStream_t stream);
+        int block_size, int max_blocks, float scale, int version,
+        float *m_part, float *l_part, float *acc_part, int n_splits,
+        cudaStream_t stream);
+
+int fd_choose_splits(int batch, int n_kv_heads, int n_blocks, int cap);
 
 torch::Tensor paged_decode_attention(torch::Tensor q,
                                      torch::Tensor k_cache,
                                      torch::Tensor v_cache,
                                      torch::Tensor block_table,
                                      torch::Tensor seq_lens,
-                                     double scale) {
+                                     double scale,
+                                     int64_t version,
+                                     int64_t splits) {
     FD_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
              "all tensors must be on CUDA");
     FD_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bfloat16");
@@ -109,6 +115,33 @@ torch::Tensor paged_decode_attention(torch::Tensor q,
     const int group = n_q_heads / n_kv_heads;
     auto out = torch::empty_like(q);
 
+    // v2 scratch for the per-split partial softmaxes. Allocated here rather
+    // than inside the kernel launch so its size is visible and so the
+    // caching allocator reuses it across calls instead of cudaMalloc-ing.
+    // At B=128 with 4 splits this is ~3 MB; at B=8 with 32 splits ~1.6 MB.
+    torch::Tensor m_part, l_part, acc_part;
+    int n_splits = 0;
+    float *mp = nullptr, *lp = nullptr, *ap = nullptr;
+    if (version == 2) {
+        // block_table.size(1) is already a host-side int and bounds the
+        // block count. The obvious seq_lens.max().item<int>() instead forces
+        // a DEVICE-TO-HOST SYNC on every call, which breaks pipelining and
+        // makes each launch pay full latency -- it was in the v2 path only
+        // and is part of why v2 looked slower than v1 at shapes where
+        // splitting should have been free.
+        const int n_blocks = max_blocks;
+        n_splits = splits > 0
+                 ? static_cast<int>(splits)
+                 : fd_choose_splits(batch, n_kv_heads, n_blocks, 32);
+        auto f32 = q.options().dtype(torch::kFloat32);
+        m_part = torch::empty({batch, n_q_heads, n_splits}, f32);
+        l_part = torch::empty({batch, n_q_heads, n_splits}, f32);
+        acc_part = torch::empty({batch, n_q_heads, n_splits, head_dim}, f32);
+        mp = m_part.data_ptr<float>();
+        lp = l_part.data_ptr<float>();
+        ap = acc_part.data_ptr<float>();
+    }
+
     const bool launched = paged_decode_attention_launch(
         reinterpret_cast<const bf16 *>(q.data_ptr()),
         reinterpret_cast<const bf16 *>(k_cache.data_ptr()),
@@ -116,9 +149,11 @@ torch::Tensor paged_decode_attention(torch::Tensor q,
         block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
         reinterpret_cast<bf16 *>(out.data_ptr()),
         batch, n_kv_heads, group, head_dim, block_size, max_blocks,
-        static_cast<float>(scale), at::cuda::getCurrentCUDAStream());
+        static_cast<float>(scale), static_cast<int>(version),
+        mp, lp, ap, n_splits, at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(launched,
-                "no paged attention kernel built for group=", group,
+                "no paged attention kernel built for version=", version,
+                " group=", group,
                 " head_dim=", head_dim, " block_size=", block_size,
                 ". v0 covers head_dim=128 with group in {1,2,3,4,6,8} and "
                 "block_size in {16,32}; add a FD_LAUNCH line in "
@@ -132,5 +167,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_residual", &rmsnorm_residual,
           "fused RMSNorm + residual (bf16)");
     m.def("paged_decode_attention", &paged_decode_attention,
-          "paged GQA decode attention (bf16)");
+          "paged GQA decode attention (bf16); version 0, 1 or 2",
+          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
+          py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
+          py::arg("version") = 2, py::arg("splits") = 0);
 }

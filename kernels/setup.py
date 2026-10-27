@@ -46,7 +46,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="fd_kernels",
-            sources=["bindings.cpp", "rmsnorm.cu"],
+            sources=["bindings.cpp", "rmsnorm.cu", "paged_attention.cu"],
             extra_compile_args={
                 "cxx": ["-O3", f"-std={CXX_STD}"],
                 "nvcc": [

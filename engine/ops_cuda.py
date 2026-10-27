@@ -27,6 +27,7 @@ PYTHONPATH.
 from __future__ import annotations
 
 import os
+import torch
 import sys
 import warnings
 
@@ -87,3 +88,22 @@ def status() -> str:
     if AVAILABLE:
         return f"fd_kernels loaded from {fd_kernels.__file__}"
     return f"fd_kernels unavailable: {IMPORT_ERROR}"
+
+
+if AVAILABLE:
+
+    @register("paged_decode_attention", "cuda")
+    def paged_decode_attention_cuda(q, k_cache, v_cache, block_table,
+                                    seq_lens, scale):
+        """Same signature as ops.paged_decode_attention_ref.
+
+        The reference loops over sequences in Python and gathers each one's
+        blocks; this reads the cache in place. Note seq_lens must be int32 --
+        the engine passes `slens + 1`, which keeps the dtype, but a caller
+        building it by hand can easily produce int64 and the binding will
+        reject it rather than reinterpret the bytes.
+        """
+        return fd_kernels.paged_decode_attention(
+            q.contiguous(), k_cache.contiguous(), v_cache.contiguous(),
+            block_table.contiguous().to(torch.int32),
+            seq_lens.contiguous().to(torch.int32), float(scale))

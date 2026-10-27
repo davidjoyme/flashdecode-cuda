@@ -441,6 +441,72 @@ def t_engine_prefill_vectorised_scatter():
     return "vectorised prefill scatter == token-by-token, and bounds-checked"
 
 
+# ----------------------------------------------------------------------
+# Phase 4 kernel (skipped without a GPU / an unbuilt extension)
+# ----------------------------------------------------------------------
+
+def t_cuda_paged_attention():
+    """Phase 4 v0 vs the Phase 3 reference, on the real model's shapes.
+
+    bf16 with fp32 accumulation, so this is a TOLERANCE test, not
+    bit-exactness: the kernel's online softmax visits tokens in a different
+    order than the reference's batched max-then-exp, and reordering fp32 adds
+    changes the last bits. The recurrence itself was verified against
+    standard softmax to fp32 epsilon in simulation; what is checked here is
+    that the indexing, masking and GQA mapping agree.
+    """
+    import torch as T
+    if not T.cuda.is_available():
+        return "SKIP (no CUDA device)"
+    try:
+        from engine import ops_cuda
+        if not ops_cuda.AVAILABLE:
+            return f"SKIP ({ops_cuda.status()})"
+        if "cuda" not in ops.active_impls("paged_decode_attention"):
+            return "SKIP (paged kernel not registered)"
+    except Exception as e:
+        return f"SKIP ({type(e).__name__}: {e})"
+
+    from engine.paged_cache import PagedKVCache
+    dev, dt = "cuda", T.bfloat16
+    n_kv, G, d = 2, 6, 128                      # Qwen2.5-1.5B
+    n_q = n_kv * G
+    worst = 0.0
+    for bs in (16, 32):
+        for lens in ([1], [1, 16, 17, 100], [2048] * 4, [1, 2047, 1024, 5]):
+            B = len(lens)
+            mb = max((n + bs - 1) // bs for n in lens) + 1
+            pc = PagedKVCache(1, n_kv, d, num_blocks=sum(
+                (n + bs - 1) // bs for n in lens) + 8,
+                max_seqs=B, max_blocks_per_seq=mb, block_size=bs,
+                dtype=dt, device=dev)
+            filler = []
+            for b, n in enumerate(lens):        # scramble ownership
+                filler.append(pc.alloc.allocate(1))
+                pc.add_sequence(b, n)
+            for f in filler:
+                pc.alloc.free(f)
+            pc.k[0].normal_(0, 0.5)
+            pc.v[0].normal_(0, 0.5)
+            q = T.randn(B, n_q, d, device=dev, dtype=dt) * 0.5
+            table, slens = pc.active_view(list(range(B)))
+            scale = 1.0 / d ** 0.5
+
+            want = ops._REGISTRY["paged_decode_attention"]["ref"](
+                q, pc.k[0], pc.v[0], table, slens, scale)
+            got = ops._REGISTRY["paged_decode_attention"]["cuda"](
+                q, pc.k[0], pc.v[0], table, slens, scale)
+            scale_ref = want.float().abs().max().item()
+            err = (want.float() - got.float()).abs().max().item()
+            rel = err / max(scale_ref, 1e-6)
+            worst = max(worst, rel)
+            assert rel < 0.02, (
+                f"bs={bs} lens={lens}: max_abs={err:.3e} rel={rel:.3e}")
+            del pc
+            T.cuda.empty_cache()
+    return f"cuda paged attention == reference (worst rel {worst:.2e})"
+
+
 TESTS = [
     t_alloc_basic, t_alloc_lifo, t_alloc_exhaustion, t_alloc_double_free,
     t_alloc_no_overlap,
@@ -450,6 +516,7 @@ TESTS = [
     t_paged_append_and_advance, t_paged_no_cross_sequence_leak,
     t_engine_paged_equals_contiguous, t_engine_paged_many_boundaries,
     t_engine_paged_cache_reuse, t_engine_prefill_vectorised_scatter,
+    t_cuda_paged_attention,
     t_paged_masks_partial_block,
 ]
 

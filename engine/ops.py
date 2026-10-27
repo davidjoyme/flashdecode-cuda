@@ -266,3 +266,9 @@ def paged_decode_attention_ref(q: torch.Tensor,
         out[b] = torch.einsum("kgn,nkd->kgd", probs, v).reshape(n_q, d).to(q.dtype)
 
     return out
+
+
+def active_impls(op: str) -> list:
+    """Which implementations exist for `op`. Lets tests skip cleanly instead
+    of raising when a kernel has not been built."""
+    return list(_REGISTRY.get(op, {}))

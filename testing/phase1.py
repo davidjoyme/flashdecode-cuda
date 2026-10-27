@@ -387,6 +387,19 @@ def stage_baseline(cfg, eng, shapes, impls=("ref", "cuda"), steps=24) -> dict:
     # cleanest. This alone is what turned the B=200 OOM into a pass.
     shapes = sorted(shapes, key=lambda s: -(s[0] * s[1]))
 
+    if os.environ.get("FD_CACHE") == "paged":
+        # paged_decode_attention_ref loops over sequences in PYTHON. At B=128
+        # that is 128 x 28 layers x 24 steps x 5 trials = 430k iterations per
+        # shape, each launching a handful of tiny kernels -- minutes per row,
+        # and the number measures Python, not the GPU. Phase 3 is a
+        # correctness phase; skip it until the Phase 4 CUDA kernel exists.
+        print("  SKIPPED for the paged cache: the paged reference attention is")
+        print("  a Python loop over sequences, so timing it measures the")
+        print("  interpreter. Correctness (stages 1-4) is what Phase 3 is for.")
+        print("  Use the contiguous cache for timings until Phase 4 lands a")
+        print("  real paged kernel:  python -m testing.phase1")
+        return {}
+
     free0, _ = torch.cuda.mem_get_info()
     print(f"  free VRAM at start of stage 5: {free0/1e9:.1f} GB\n")
     print("  Each number is the BEST of 5 trials: contention can only slow us")

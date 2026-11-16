@@ -1,17 +1,3 @@
-"""
-Achievable HBM bandwidth. GPU required.
-
-Every speed-of-light claim divides by a bandwidth number. Use the MEASURED
-one, never the spec sheet. Real kernels top out around 80-93% of spec
-depending on architecture, so quoting spec makes your own kernels look worse
-than they are AND makes you look like you did not check.
-
-    python -m bench.bandwidth
-
-Record the result in logs/EXPERIMENTS.md with the device name. Re-run if you
-change GPUs; a thermally throttled card reads ~10% low.
-"""
-
 from __future__ import annotations
 import torch
 

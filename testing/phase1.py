@@ -1,44 +1,10 @@
-"""
-Phase 1 gate. One command, one verdict.
-
-    python -m testing.phase1
-
-Runs the whole gate in order and exits non-zero if any stage fails:
-
-  1. CPU smoke suite            -- structure (no GPU, no download)
-  2. oracle freshness           -- does oracle.pt match the CURRENT config?
-  3. activation diff vs HF      -- numerics, bf16, layer by layer
-  4. greedy token parity        -- end-to-end determinism
-  5. naive decode baseline      -- ms/step and tok/s at real shapes
-
-Stage 2 exists because a stale oracle is the sneakiest failure mode here:
-change MODEL_ID or PARITY_PROMPT, forget to regenerate, and stage 3 diffs
-your engine against a different model entirely. The errors look like real
-bugs and are not.
-
-Stage 5 is the number every Phase 2-5 result gets compared against, so it is
-part of the gate rather than an afterthought -- a baseline you forgot to
-record is a baseline you cannot claim an improvement over.
-
-Stage 5 does NOT run a real prefill to fill the cache. A B=128 ctx=4096
-prefill through SDPA would materialise ~1.6 GB per tensor after the GQA
-repeat_interleave and can OOM or take minutes, which is pointless when
-correctness was already settled in stages 3-4. Instead the cache is filled
-with random KV and seq_lens is set directly, which is exactly the state a
-decode step sees. Timing only -- never correctness.
-"""
-
 from __future__ import annotations
-
 import gc
 import os
 import time
 import traceback
-
 import torch
-
 import config
-
 
 def _hdr(n: int, title: str) -> None:
     print(f"\n{'=' * 72}\n[{n}/5] {title}\n{'=' * 72}")

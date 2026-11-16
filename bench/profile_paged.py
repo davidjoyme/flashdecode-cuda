@@ -1,41 +1,9 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/bench/profile_paged.py
-# RUN AS:         python -m bench.profile_paged --batch 128 --ctx 2048
-# REQUIRES:       ncu on PATH (/usr/local/cuda-13.0/bin/ncu)
-# ==========================================================================
-"""
-Hardware-counter profile of the Phase 4 paged attention kernel.
-
-The one metric worth collecting even on a contended GPU is
-`dram__bytes.sum`. It is a hardware counter, so it is unaffected by what
-else is running -- unlike duration and throughput, which contention
-distorts. That makes it the right thing to measure first here.
-
-It also tests a specific claim. The kernel is supposed to read each KV head
-ONCE and reuse it across the GROUP=6 query heads sharing it, where the
-PyTorch reference expands with repeat_interleave and then upcasts to fp32.
-So the prediction is:
-
-    dram__bytes  ~=  2 (K,V) x B x ctx x n_kv_heads x head_dim x 2 bytes
-
-with NO factor of GROUP and NO factor of 2 for fp32. At B=128, ctx=2048 that
-is 268 MB against the reference's 3221 MB. If the counter comes back near
-268 MB, the 12x traffic reduction is measured rather than asserted. If it
-comes back near 1600 MB, the GQA reuse is not happening and the kernel is
-re-reading per query head.
-
-Reusing _parse from bench/profile_rmsnorm so the two profilers cannot drift
-in how they read ncu's two different CSV layouts.
-"""
-
 from __future__ import annotations
-
 import argparse
 import os
 import shutil
 import subprocess
 import sys
-
 from bench.profile_rmsnorm import _parse
 
 METRICS = [

@@ -1,53 +1,3 @@
-// ==========================================================================
-// FILE LOCATION:  flashdecode/kernels/paged_attention.cu
-// BUILD:          cd kernels && python setup.py build_ext --inplace
-// ==========================================================================
-//
-// Paged GQA decode attention. Phase 4 v0 -- CORRECT, not yet optimised.
-//
-// out[b,h,:] = sum_t softmax_t( q[b,h,:] . K[b,t,:] * scale ) * V[b,t,:]
-//
-// where K/V for sequence b token t live at
-//   block = block_table[b, t / BLOCK_SIZE]
-//   slot  = t % BLOCK_SIZE
-//   k_cache[block, kv_head, slot, :]
-//
-// -------------------------------------------------------------------------
-// v0 DESIGN, and what is deliberately left for later
-// -------------------------------------------------------------------------
-// One block per (sequence, KV head). Each block handles all GROUP query heads
-// that share that KV head, which is the point of GQA: the KV data is read
-// ONCE from memory and reused across the group, instead of the reference
-// implementation's repeat_interleave that materialises GROUP copies.
-//
-// Grid  = (n_kv_heads, batch)        -> 2 x B blocks for this model
-// Block = 256 threads
-//
-// At B=128 that is 256 blocks on 170 SMs. Phase 2 measured 0.09 waves/SM for
-// a B-sized grid and showed that is the whole problem at decode shapes;
-// multiplying the grid by n_kv_heads is the first structural improvement, and
-// v2 (split-KV) will multiply it again.
-//
-// Online softmax, one pass. The whole KV history is streamed once, keeping a
-// running max and running sum per query head and rescaling the accumulator
-// when the max moves. The alternative -- scores to scratch, max, exp, sum,
-// weighted sum -- would read KV twice and need O(seq_len) storage. This is
-// the same recurrence FlashAttention uses, applied to a single query row.
-//
-// NOT in v0, by design. Each gets its own measurement so the writeup can
-// attribute the gains:
-//   v1  vectorised 128-bit loads, shared-memory staging for q
-//   v2  split the KV range across blocks + a combine pass (Flash-Decoding),
-//       which is what rescues batch-1 and short-context cases
-//   v3  more aggressive register blocking across the query group
-//   v4  sm_120 specifics -- cp.async pipelining; NOT wgmma/tcgen05, which do
-//       not exist on this architecture
-//
-// Accumulation is fp32 throughout. The cache is bf16 and is read as bf16;
-// nothing is ever upcast in memory, which is the single biggest difference
-// from the PyTorch reference -- that upcast cost 3.25 GB of transient at
-// B=128 and was what OOM'd the Phase 1 baseline.
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -187,52 +137,6 @@ __global__ void paged_decode_attention_kernel(
     }
 }
 
-
-// ==========================================================================
-// v1 -- thread groups + 16-byte vectorised loads
-// ==========================================================================
-//
-// v0 measured 3273 us at B=1 ctx=2048 against SDPA's 419 us, i.e. 8x SLOWER,
-// and 0% of a 1.3 us SOL. The cause is in the inner loop, not the memory
-// system. Per token v0 does:
-//
-//   4 scalar bf16 loads of K (2 bytes each -- no vectorisation)
-//   5 __shfl_xor rounds to reduce across all 32 lanes
-//   4 scalar bf16 loads of V
-//
-// and it does this ONE TOKEN AT A TIME, so there is zero token-level
-// parallelism inside a warp. Over ctx=2048 that is 10,240 *dependent*
-// shuffle rounds per query head; at ~25 cycles of shuffle latency that
-// alone accounts for ~107 us before a single byte of memory is considered.
-// v0 is latency-bound on its own reduction.
-//
-// v1 changes the thread mapping. Each thread takes VEC=8 bf16 (16 bytes,
-// one uint4 -- the widest load the pipe accepts), so TG = HEAD_DIM/VEC = 16
-// threads cooperate on one token and a warp covers WARP/TG = 2 tokens
-// concurrently:
-//
-//   loads per token per thread : 1 x 16B   (was 4 x 2B)   -> 4x fewer insts
-//   reduction rounds           : 4         (was 5)        -> and only within
-//                                                            16 lanes
-//   tokens in flight per warp  : 2         (was 1)
-//   dependent shuffle rounds   : 4,096     (was 10,240)   -> 2.5x fewer
-//
-// The cost is that each warp now holds TWO independent online-softmax
-// partials -- one per thread group -- which must be merged at the end:
-//
-//   m = max(m0, m1)
-//   l = l0*exp(m0-m) + l1*exp(m1-m)
-//   acc = acc0*exp(m0-m) + acc1*exp(m1-m)
-//
-// This is the same merge Flash-Decoding uses across blocks, applied across
-// thread groups instead. Verified exact to double precision against a
-// single-pass reference, including the case where one group gets no tokens
-// at all (m stays -inf, so its exp(m-max) term is 0 and contributes nothing
-// rather than NaN).
-//
-// Still NOT in v1: splitting the KV range across BLOCKS. At B=1 the grid is
-// 2 blocks on 170 SMs and no amount of inner-loop work fixes that -- it is
-// what v2 is for.
 
 template <int GROUP, int HEAD_DIM, int BLOCK_SIZE, int THREADS>
 __global__ void paged_decode_attention_v1_kernel(
@@ -376,54 +280,6 @@ __global__ void paged_decode_attention_v1_kernel(
             *reinterpret_cast<const uint4 *>(packed);
     }
 }
-
-// --------------------------------------------------------------------------
-// Launcher. Returns false if the shape is not covered, so the binding can
-// raise instead of leaving `out` uninitialised -- a silent no-op would look
-// like a numerics bug rather than a configuration one.
-// --------------------------------------------------------------------------
-
-// ==========================================================================
-// v2 -- split-KV (Flash-Decoding) + combine pass
-// ==========================================================================
-//
-// v1 measured FLAT at ~1600-1800 us from B=1 to B=32 while the work grew
-// 32x. That is the diagnosis, not a puzzle: each block streams the whole
-// context for its (sequence, KV head), so per-block serial time is set by
-// CONTEXT LENGTH and extra blocks just run in parallel for free. Batch size
-// is irrelevant to the critical path.
-//
-// Measured ~1877 cycles per token for two 16-byte loads, four shuffles and
-// two expf. That is exposed memory latency: at B=1 the grid is 2 blocks x 6
-// active warps = 12 warps on a 170-SM GPU, so there is nothing to interleave
-// and every load's ~500-cycle latency is paid in full.
-//
-// The fix is to shorten the per-block chain, not to speed up its arithmetic.
-// Split the context into n_splits ranges, give each its own block, and merge
-// the partial softmaxes afterwards:
-//
-//   grid = (n_kv_heads, batch, n_splits)
-//
-//   B=  1: splits=32 -> 64 blocks,  64 tokens/block  (32x shorter chain)
-//   B= 32: splits=14 -> 896 blocks, 146 tokens/block (1.05 waves)
-//   B=128: splits= 4 -> 1024 blocks, 512 tokens/block (1.20 waves)
-//
-// Each partial block writes (m, l, acc) to scratch and a second kernel
-// merges them with the same recurrence v1 already uses across thread groups:
-//
-//   m = max_s m_s
-//   l = sum_s l_s * exp(m_s - m)
-//   acc = sum_s acc_s * exp(m_s - m)
-//
-// verified exact to double precision against a single-pass reference, for 2
-// and 4 groups and for empty groups. A split that gets no blocks leaves
-// m = -inf and l = 0, so it contributes nothing -- but exp(-inf - -inf) is
-// NaN, so the combine tests isfinite(m_s) explicitly rather than relying on
-// the arithmetic.
-//
-// This is Flash-Decoding, cited as prior art rather than reinvented. What is
-// new here is nothing about the algorithm; it is that there is no working
-// implementation of it for sm_120.
 
 template <int GROUP, int HEAD_DIM, int BLOCK_SIZE, int THREADS>
 __global__ void paged_attn_v2_partial(

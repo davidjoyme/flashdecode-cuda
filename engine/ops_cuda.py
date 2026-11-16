@@ -1,36 +1,8 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/engine/ops_cuda.py
-# IMPORTED AS:    engine.ops_cuda      (run everything from the project root)
-# ==========================================================================
-"""
-CUDA implementations, registered against the existing op names.
-
-Importing this module registers the kernels; it does not activate them.
-Activate explicitly:
-
-    from engine import ops, ops_cuda          # noqa: F401
-    ops.use("rmsnorm_residual", "cuda")
-
-or ops.use_all("cuda") to switch every op that has a CUDA impl. Ops without
-one stay on the reference path, which is the whole point of the registry:
-you can run a half-CUDA model and bisect a correctness bug to one kernel.
-
-IMPORT PATH (fixed 2026-10-27): `setup.py build_ext --inplace` writes
-fd_kernels*.so into kernels/, but every script here runs as
-`python -m pkg.module` from the PROJECT ROOT, so kernels/ is not on
-sys.path and a bare `import fd_kernels` fails. The result was the worst kind
-of error message -- "not built, run setup.py" immediately after a successful
-build. So add kernels/ to sys.path here rather than asking anyone to set
-PYTHONPATH.
-"""
-
 from __future__ import annotations
-
 import os
 import torch
 import sys
 import warnings
-
 from engine.ops import register
 
 _KERNELS_DIR = os.path.join(

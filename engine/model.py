@@ -1,70 +1,8 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/engine/model.py
-# IMPORTED AS:    engine.model
-# ==========================================================================
-"""
-Naive decode engine for Llama and Qwen2.
-
-RESIDUAL THREADING (changed 2026-10-27 to use the Phase 2 fused kernel).
-
-The textbook way to write a transformer block is
-
-    residual = h
-    hn = rmsnorm(h)
-    h  = residual + attn(hn)
-
-which puts the add at the END of one block and the norm at the START of the
-next -- opposite sides of the loop boundary, so they can never be fused.
-
-This engine instead carries two values across the loop, the way vLLM and
-TensorRT-LLM do:
-
-    hidden    the DELTA produced by the last sub-block (o_proj or down_proj)
-    residual  the running accumulated hidden state
-
-and each norm site becomes one call:
-
-    hn, residual = rmsnorm_residual(hidden, residual, w, eps)
-                   # residual <- residual + hidden   (the deferred add)
-                   # hn       <- rmsnorm(new residual)
-
-Now the add and the norm are adjacent inside a single op, which is exactly
-what kernels/rmsnorm.cu fuses: it writes both outputs in one pass over the
-data and turns 2 kernel launches into 1, 56 times per decode step.
-
-Equivalence is exact, not approximate. The old form computed
-`residual + linear(...)`; the new one computes `x + residual` inside the op.
-IEEE addition is commutative, so the bits are identical -- which means the
-restructure can be validated with ops.use("rmsnorm_residual", "ref") BEFORE
-the CUDA kernel is switched on, separating "did I restructure correctly" from
-"is my kernel correct".
-
-One wrinkle: the diff harness traces each layer's accumulated output, which
-in delta form is `residual + hidden` and is not materialised anywhere. It is
-computed only when tracing is on, so the hot path pays nothing.
-
----
-
-This is OUR forward pass, not HuggingFace's. That is the point: every op that
-later becomes a CUDA kernel goes through ops.call(), so swapping in a kernel
-is a registry change and the parity harness immediately reports if it broke.
-
-Phase 1 goal is correctness, not speed. Prefill uses SDPA and is not an
-optimisation target -- decode is.
-
-Qwen2 note: q_proj/k_proj/v_proj carry a bias. It is fetched once in __init__
-and passed to F.linear, which accepts None for the Llama case, so there is no
-per-layer branch in the hot path.
-"""
-
 from __future__ import annotations
-
 import math
 from typing import Dict, Optional
-
 import torch
 import torch.nn.functional as F
-
 from config import LlamaConfig
 from engine import ops
 from engine.cache import ContiguousKVCache

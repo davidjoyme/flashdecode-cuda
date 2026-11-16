@@ -1,20 +1,6 @@
-"""
-The op boundary. UNCHANGED by the Qwen switch.
-
-Qwen2 uses the same RMSNorm, the same rotate_half RoPE convention, the same
-SwiGLU and the same attention maths as Llama. The only delta is the QKV bias,
-which lives in the projections (model.py), not in any of these ops.
-
-Every operation destined to become a CUDA kernel lives here as a pure-PyTorch
-reference with a FROZEN signature. Model code calls ops.call(name, ...) and
-never an implementation directly.
-"""
-
 from __future__ import annotations
-
 import math
 from typing import Callable, Dict, Optional
-
 import torch
 
 _IMPL: Dict[str, str] = {}

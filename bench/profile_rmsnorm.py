@@ -1,47 +1,4 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/bench/profile_rmsnorm.py
-# RUN AS:         python -m bench.profile_rmsnorm            (from project root)
-#                 python -m bench.profile_rmsnorm --batch 2048
-# REQUIRES:       ncu on PATH (ships with the CUDA toolkit:
-#                 /usr/local/cuda-13.0/bin/ncu)
-# ==========================================================================
-"""
-Profile the rmsnorm kernel with hardware counters instead of wall-clock.
-
-WHY THIS EXISTS. bench/kernel_rmsnorm.py tried to measure achieved bandwidth
-by timing a loop and dividing bytes by seconds. Three successive attempts all
-failed, in different ways:
-
-  attempt 1  reused one buffer      -> 4829 GB/s, 292% of peak (pure L2)
-  attempt 2  rotated 3x L2          -> 2374 GB/s, 143% of peak (still L2)
-  attempt 3  rotated 6x L2 + graph  -> kernel 57/78/64% across three shapes
-                                       that should be identical, and a plain
-                                       torch copy_ control came back at 38%
-                                       of peak, which is nonsense
-
-The lesson is not "try harder at the arithmetic". Wall-clock bandwidth is the
-wrong instrument: bytes/second computed from a timing loop cannot distinguish
-traffic that came from DRAM from traffic that came from L2, and that
-distinction IS the measurement. ncu reads the hardware counters and reports
-DRAM sectors directly, so L2 hits simply do not appear as DRAM traffic.
-
-The decisive metric is dram__bytes.sum. Compare it to the logical footprint
-(4 * B * H * 2 bytes for this kernel):
-
-  dram__bytes ~= logical   -> the kernel really is streaming from memory, and
-                              dram__throughput.pct_of_peak is a trustworthy
-                              efficiency number
-  dram__bytes << logical   -> L2 served most of it; any wall-clock "bandwidth"
-                              figure from that configuration was fiction
-
-Also collected, because they answer the questions Phase 2 actually asked:
-  achieved occupancy   -- ptxas said 8 blocks/SM fit; what happened in reality
-  stall reasons        -- what the warps were waiting on
-  SM vs DRAM throughput-- which unit is the limiter
-"""
-
 from __future__ import annotations
-
 import argparse
 import os
 import shutil

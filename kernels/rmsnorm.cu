@@ -1,31 +1,3 @@
-// Fused RMSNorm + residual add. Phase 2, first custom kernel.
-//
-//   h   = x + residual          (bf16, written back as the new residual)
-//   out = weight * bf16(h * rsqrt(mean(h^2) + eps))
-//
-// Both outputs are produced in ONE pass, which is the point: in the unfused
-// path this is two kernel launches per call and 2x num_layers launches per
-// decode step. At decode batch sizes the arithmetic here is sub-microsecond,
-// so launch count matters more than bandwidth.
-//
-// Target: sm_120 (consumer Blackwell / RTX 5090). Nothing here needs wgmma or
-// tcgen05, neither of which exists on sm_120 -- this is a bandwidth kernel, so
-// the missing tensor-core paths are irrelevant.
-//
-// TILING (changed 2026-10-27 for the Qwen switch): one block per row, one
-// 128-bit load per thread, so THREADS = H/8 and no thread loops. Qwen hidden
-// sizes are not powers of two the way Llama's are:
-//
-//   Qwen2.5-1.5B  H=1536 -> 192 threads ( 6 warps)  <-- current target
-//   Qwen2.5-3B    H=2048 -> 256 threads ( 8 warps)
-//   Qwen2.5-7B    H=3584 -> 448 threads (14 warps)
-//   Llama-3.2-1B  H=2048 -> 256 threads ( 8 warps)
-//   Qwen2.5-0.5B  H= 896 -> 112 threads (3.5 warps) -- UNSUPPORTED, see below
-//
-// The earlier version hardcoded 256 threads and required H % 2048 == 0, which
-// silently excluded H=1536. Requiring THREADS % 32 == 0 instead keeps the
-// warp-shuffle reduction valid for every size it accepts.
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 

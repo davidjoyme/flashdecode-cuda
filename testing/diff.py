@@ -1,44 +1,7 @@
-"""
-Layer-by-layer diff harness -- the Phase 1 gate.
-
-When output is garbage this tells you WHICH layer first went wrong, turning a
-twelve-component mystery into a one-component bug.
-
-Layers are compared in EXECUTION order, and only the first divergence means
-anything: once layer 7 is wrong, layers 8..31 are wrong too and their numbers
-are noise. Read the first flagged line, ignore everything below it.
-
-TOLERANCE (revised 2026-10-27). A flat absolute tolerance is wrong here,
-because the tensors in this trace do not share a scale. Hidden states run
-~1, logits run ~10-30. 2e-2 is a sensible atol for a hidden state and far
-too tight for a logit: one bf16 ULP at magnitude 8-16 is already 6.25e-02,
-so a single-ULP rounding difference in the final matmul trips an atol that
-is perfectly calibrated for every other row in the table.
-
-That is not hypothetical -- it is what the first green Qwen run did. Every
-one of the 28 layers and final_norm came back bit-exact, greedy parity was
-32/32 exact, and 'logits' alone reported 6.250e-02 and got flagged.
-
-So the gate compares against the TENSOR'S OWN SCALE, in units of bf16 ULPs:
-
-    ulps = max|a - b| / (max|b| * 2^-8)
-
-2^-8 is the relative spacing of bf16 (8 bits of significand). A result
-within a couple of ULPs of the tensor scale is at the floor of what bf16
-can represent and cannot be improved by fixing code -- only by matching the
-reference's exact reduction order. Both measures are printed; the verdict
-uses whichever is satisfied.
-
-    python -m testing.diff
-"""
-
 from __future__ import annotations
-
 import re
 from typing import Dict, List, Tuple
-
 import torch
-
 import config
 
 # Relative spacing of bf16: 1 sign + 8 exponent + 7 explicit mantissa bits,

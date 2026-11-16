@@ -1,15 +1,3 @@
-"""
-KV cache.
-
-Phase 1 uses a dead-simple contiguous cache: one [B, max_len, n_kv, d] tensor
-per layer for K and for V. It wastes memory proportional to max_len and
-cannot handle ragged batches efficiently. That is fine -- its job is to be
-obviously correct so the Phase 3 paged cache has something to diff against.
-
-The interface is deliberately one a PAGED cache can also satisfy, so
-model.py does not change in Phase 3.
-"""
-
 from __future__ import annotations
 import torch
 

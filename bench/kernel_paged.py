@@ -1,56 +1,9 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/bench/kernel_paged.py
-# RUN AS:         python -m bench.kernel_paged --bw 1655
-#                 python -m bench.kernel_paged --bw 1655 --block-size 32
-# ==========================================================================
-"""
-Phase 4 kernel benchmark: ours vs credible baselines.
-
-WHY THE BASELINE CHOICE MATTERS MORE THAN THE NUMBER.
-
-The Phase 1 reference (paged_decode_attention_ref) loops over sequences in
-Python, expands KV with repeat_interleave and upcasts to fp32. Beating it by
-50x proves nothing -- it was written to be obviously correct, not fast, and
-saying "50x faster than my own strawman" is the single easiest way to lose
-credibility with anyone who reads the code.
-
-So three opponents, strongest first:
-
-  torch SDPA     F.scaled_dot_product_attention on a CONTIGUOUS cache, with
-                 enable_gqa=True where available so it does NOT pay the
-                 repeat_interleave expansion. This is the honest "what does
-                 the best available PyTorch path cost" number and it is the
-                 baseline the writeup should lead with. Note the layout
-                 differs -- contiguous vs paged -- which is stated rather
-                 than hidden: it is what you would actually write without a
-                 paged kernel, so it is the right thing to beat.
-
-  vLLM paged     vllm's own paged_attention CUDA kernel if it imports. These
-                 are Ampere-era hand-written CUDA with no wgmma dependency,
-                 so they MAY build on sm_120 where FlashAttention and
-                 FlashInfer do not. If it works, this is the headline
-                 comparison. If it does not, that failure is itself a result
-                 -- record the exact error.
-
-  ref (paged)    the Phase 3 Python reference, for scale only. Reported, never
-                 quoted as the speedup.
-
-SOL is computed on the bytes the kernel MUST read: 2 (K,V) x B x ctx x
-n_kv_heads x head_dim x 2. Note that is already the GQA-aware figure -- each
-KV head is read once, not GROUP times -- so %SOL here is measured against the
-genuinely irreducible traffic, not against a padded number that would
-flatter the kernel.
-"""
-
 from __future__ import annotations
-
 import argparse
 import statistics
 import time
-
 import torch
 import torch.nn.functional as F
-
 from engine import ops
 from engine.paged_cache import PagedKVCache
 

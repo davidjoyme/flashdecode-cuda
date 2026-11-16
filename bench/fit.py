@@ -1,38 +1,5 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/bench/fit.py
-# RUN AS:         python -m bench.fit                  (uses live free VRAM)
-#                 python -m bench.fit --budget 20      (assume 20 GB free)
-# ==========================================================================
-"""
-Which (batch, context) shapes actually fit right now?
-
-On a shared GPU the answer changes minute to minute, and guessing wastes a
-run: an OOM mid-benchmark leaves fragmented memory that spoils the shapes
-after it, and the pre-flight skip in testing/phase1.py only tells you a
-shape did not fit AFTER you asked for it.
-
-This prints the feasible envelope first, so you pick shapes you can keep.
-
-Memory model for one decode configuration:
-
-    weights    fixed, ~3.09 GB for Qwen2.5-1.5B in bf16
-    rope       2 tables of max_pos x head_dim fp32  (cap this, see below)
-    KV cache   2 (K,V) x B x ctx x n_kv_heads x head_dim x 2B x n_layers
-    transient  the reference attention upcasts one layer's KV to fp32:
-               B x ctx x n_kv_heads x head_dim x 4B, times 2 for K and V
-
-That transient term is why the measured ceiling is lower than a naive
-weights+cache estimate. It is also the thing the Phase 4 kernel deletes
-entirely -- a real paged kernel reads the bf16 cache in place and never
-materialises an fp32 copy, so the same card will hold a noticeably larger
-batch once Phase 4 lands. Worth stating in the writeup: paging plus a
-fused kernel buys batch size, and batch size is throughput.
-"""
-
 from __future__ import annotations
-
 import argparse
-
 from config import LlamaConfig
 
 

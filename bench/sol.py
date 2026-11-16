@@ -1,24 +1,6 @@
-"""
-Speed-of-light model for Llama decode. No GPU needed (downloads config.json
-only, not weights).
-
-Phase 2 rule: compute SOL BEFORE writing the kernel. Measure first and you
-anchor on whatever you happened to get, then stop optimising when it stops
-being easy. Compute first and you know exactly how much is left.
-
-The point worth leading the writeup with: a decode step reads the ENTIRE
-weight matrix to produce one token per sequence. Arithmetic intensity is
-~batch_size FLOPs per byte. At batch 1, on a card whose compute:bandwidth
-ratio is in the hundreds, you are orders of magnitude from compute-bound.
-Decode is a memory problem wearing a matmul costume.
-
-    python -m bench.sol --batch 32 --ctx 4096 --bw 1500
-"""
-
 from __future__ import annotations
 import argparse
 from config import LlamaConfig
-
 
 def weight_bytes(cfg: LlamaConfig, elem: int = 2) -> int:
     """Weight bytes that must be read once per decode step regardless of

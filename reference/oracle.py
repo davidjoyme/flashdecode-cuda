@@ -1,20 +1,9 @@
-"""
-Ground-truth oracle.
-
-Runs HuggingFace's own Llama and captures (a) per-layer hidden states on the
-prefill pass and (b) the greedy token sequence. Everything the engine
-produces is diffed against this.
-
-Run once; regenerate only when MODEL_ID or PARITY_PROMPT changes.
-
-    python -m reference.oracle
-"""
-
 from __future__ import annotations
 import os
 from typing import Dict
 import torch
 import config
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oracle.pt")
 
@@ -25,8 +14,7 @@ def build(model_id: str = config.MODEL_ID,
           max_new: int = config.PARITY_MAX_NEW_TOKENS,
           device: str = config.DEVICE,
           dtype=config.DTYPE) -> Dict:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
+    
     tok = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, low_cpu_mem_usage=True).to(device).eval()

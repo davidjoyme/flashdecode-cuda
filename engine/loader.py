@@ -1,13 +1,8 @@
-"""Weight loading. Handles Llama (no biases) and Qwen2 (QKV biases)."""
-
 from __future__ import annotations
-
 from typing import Dict, Tuple
-
 import torch
-
 from config import LlamaConfig
-
+from transformers import AutoConfig, AutoModelForCausalLM
 
 def load(model_id: str, device="cuda", dtype=torch.bfloat16
          ) -> Tuple[LlamaConfig, Dict[str, torch.Tensor]]:
@@ -17,7 +12,7 @@ def load(model_id: str, device="cuda", dtype=torch.bfloat16
     handles shard indexing and checkpoint-format quirks. Wasteful (builds the
     nn.Module first) but runs once.
     """
-    from transformers import AutoConfig, AutoModelForCausalLM
+    
 
     cfg = LlamaConfig.from_hf(AutoConfig.from_pretrained(model_id))
     model = AutoModelForCausalLM.from_pretrained(

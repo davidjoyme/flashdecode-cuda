@@ -1,11 +1,6 @@
-// torch bindings for the Phase 2 kernels.
-//
-// Requires -std=c++20: torch >= 2.4 headers are C++20. See setup.py.
-
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <torch/extension.h>
-
 #include <vector>
 
 using bf16 = __nv_bfloat16;

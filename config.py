@@ -1,37 +1,5 @@
-"""
-Frozen target configuration.
-
-TARGET CHANGED (2026-10-27): Llama-3.2-1B -> Qwen2.5-1.5B.
-Llama is gated on HuggingFace and needs an accepted license; Qwen2.5 is not.
-
-Why 1.5B specifically, on a 32 GB card:
-
-  model          GQA  weights  KV budget  max B@4k   KV% of traffic
-  Qwen2.5-0.5B     7    0.99      30.1       598        96.8%
-  Qwen2.5-1.5B     6    3.09      28.0       238        90.1%
-  Qwen2.5-3B       8    6.17      24.9       165        80.1%
-  Qwen2.5-7B       7   15.23      15.9        67        50.8%
-
-KV% is what decides whether the attention kernel shows up end to end. 7B
-is capped near 50% by its own weights, so the kernel could never be worth
-more than ~2x there. 1.5B reaches 90% and its GQA group of 6 is LARGER than
-Llama-3.2-1B's 4, which makes the Phase 4 v3 GQA-reuse optimisation worth
-more, not less. 0.5B scores better still but H=896 does not tile cleanly
-(896/8 = 112 threads = 3.5 warps), so the kernels would need a tail path.
-
-ARCHITECTURE DELTA vs Llama -- the one thing that actually changes code:
-Qwen2 uses bias=True on q_proj, k_proj and v_proj. o_proj and all three MLP
-projections stay bias-free, as in Llama. Nothing else differs: same RMSNorm,
-same rotate_half RoPE, same SwiGLU, same HF module names.
-
-Qwen3 was considered and rejected for now: it adds per-head QK-norm applied
-BEFORE RoPE, which would complicate the Phase 5 fused RoPE+KV-write kernel.
-One architectural delta is enough.
-"""
-
 from dataclasses import dataclass, field
 from typing import Optional
-
 import torch
 
 # --------------------------------------------------------------------------
@@ -41,7 +9,6 @@ import torch
 MODEL_ID = "Qwen/Qwen2.5-1.5B"
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
-
 PARITY_PROMPT = "The capital of France is"
 PARITY_MAX_NEW_TOKENS = 32
 

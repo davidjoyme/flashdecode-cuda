@@ -1,37 +1,5 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/testing/test_paged.py
-# RUN AS:         python -m testing.test_paged        (CPU, no GPU needed)
-# ==========================================================================
-"""
-Phase 3 tests: block allocator, block table, paged attention.
-
-Runs on CPU in fp32 for the same reason testing/smoke.py does -- these tests
-are about INDEXING, and indexing bugs are dtype-independent. Numerics come
-later, in the bf16 parity run.
-
-The load-bearing test is t_paged_equals_contiguous. It builds the same
-logical KV history two ways -- once in a contiguous [B, max_len, ...] cache
-and once in a paged cache with a scrambled block table -- and asserts the
-two attention implementations agree. That single invariant catches, without
-a GPU or real weights:
-
-  - block index computed as t % block_size instead of t // block_size
-  - offset and block swapped
-  - the layout permute being wrong (n_kv_heads vs block_size transposed)
-  - a sequence reading another sequence's blocks
-  - the mask using blocks_needed * block_size instead of seq_len
-
-The block table is deliberately SCRAMBLED (blocks handed out non-monotonic
-and interleaved between sequences). A table where sequence b owns blocks
-b*nb .. b*nb+nb-1 passes even if the code ignores the table entirely and
-computes positions arithmetically -- which is the single easiest way to
-write a paged cache that is not actually paged.
-"""
-
 from __future__ import annotations
-
 import torch
-
 from engine import ops
 from engine.cache import ContiguousKVCache
 from engine.paged_cache import BlockAllocator, PagedKVCache

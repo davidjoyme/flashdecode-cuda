@@ -1,36 +1,6 @@
-# ==========================================================================
-# FILE LOCATION:  flashdecode/bench/kernel_rmsnorm.py
-# RUN AS:         python -m bench.kernel_rmsnorm --bw 1655
-#                 (from the project root; needs bench/__init__.py to exist,
-#                  and kernels/fd_kernels*.so to have been built)
-# ==========================================================================
-"""
-Phase 2 kernel harness: correctness, SOL, and the launch-overhead story.
-
-    python -m bench.kernel_rmsnorm --bw 1655
-
-Three timings per shape, and the gap between them is the finding:
-
-  amortized   many launches back to back, queue stays full. This is the
-              number that reflects the KERNEL's quality.
-  per-launch  one launch, synchronized. Includes dispatch overhead. This is
-              what the kernel actually costs in an eager decode loop.
-  graphed     replayed inside a CUDA graph. Shows how much of the per-launch
-              cost was dispatch rather than work.
-
-At decode batch sizes this kernel moves ~1 MB, which is well under a
-microsecond of work against several microseconds of launch overhead. Expect
-amortized to look great and per-launch to look terrible. That is not a
-broken benchmark -- it is the reason fusion and CUDA graphs matter more than
-shaving the last 5% of bandwidth here.
-"""
-
 from __future__ import annotations
-
 import argparse
-
 import torch
-
 from engine import ops
 
 try:

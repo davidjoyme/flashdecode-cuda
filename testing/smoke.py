@@ -1,42 +1,5 @@
-"""
-CPU smoke test. No GPU, no model download, no HF auth. Runs in seconds.
-
-Run this BEFORE the oracle and diff harness. It exercises the whole pipeline
--- registry, cache indexing, RoPE, GQA, QKV bias, prefill, decode -- on a tiny
-random-weight model, so structural bugs surface in seconds instead of after a
-multi-GB download and a failed parity run.
-
-The load-bearing test is decode_equals_prefill. Running prefill over S tokens
-must produce the same final logits as prefill over S-1 tokens followed by one
-decode_step on token S. That single invariant catches, without real weights:
-
-  - RoPE applied at the wrong position in the decode path
-  - KV cache written to or read from the wrong slot
-  - the off-by-one in the attention mask (seq_lens vs seq_lens+1)
-  - GQA head expansion mismatched between prefill and decode
-  - q/k/v reshape order differing between the two paths
-  - a QKV bias applied in prefill but dropped in decode, or vice versa
-
-QWEN NOTE: every structural test runs TWICE, once with qkv_bias=False (Llama
-shape) and once with qkv_bias=True (Qwen2 shape). A bias dropped from one of
-the two paths is a small consistent error that looks like a numerics problem,
-so it is worth testing explicitly rather than hoping diff.py catches it.
-
-WHAT THIS SUITE CANNOT CATCH, verified by mutation testing:
-
-It runs in fp32, so every dtype-ordering bug is invisible here. Moving the
-weight multiply in rmsnorm to before the cast back to bf16 passes all tests,
-because in fp32 that cast is a no-op. The same blindness applies to
-accumulator precision and any bf16 rounding difference. Those surface only in
-the real bf16 parity run.
-
-    python -m testing.smoke
-"""
-
 from __future__ import annotations
-
 import torch
-
 from config import LlamaConfig
 from engine import ops
 from engine.loader import validate

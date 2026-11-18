@@ -3,6 +3,12 @@ import torch
 from engine import ops
 from engine.cache import ContiguousKVCache
 from engine.paged_cache import BlockAllocator, PagedKVCache
+from testing.smoke import random_weights, tiny_config
+from engine.model import LlamaEngine
+from engine.paged_cache import PagedKVCache
+import torch as T
+from engine import ops_cuda
+from engine.paged_cache import PagedKVCache
 
 DEV = "cpu"
 DT = torch.float32
@@ -310,8 +316,7 @@ def t_paged_masks_partial_block():
 # ----------------------------------------------------------------------
 
 def _engine():
-    from testing.smoke import random_weights, tiny_config
-    from engine.model import LlamaEngine
+
     cfg = tiny_config(qkv_bias=True)
     return cfg, LlamaEngine(cfg, random_weights(cfg), DEV, DT, rope_max_pos=64)
 
@@ -372,7 +377,7 @@ def t_engine_paged_cache_reuse():
 
 def t_engine_prefill_vectorised_scatter():
     """append_prefill's vectorised scatter must match a token-by-token write."""
-    from engine.paged_cache import PagedKVCache
+    
     torch.manual_seed(0)
     n_kv, d, bs, B, S = 2, 8, 4, 3, 11
 
@@ -423,11 +428,11 @@ def t_cuda_paged_attention():
     standard softmax to fp32 epsilon in simulation; what is checked here is
     that the indexing, masking and GQA mapping agree.
     """
-    import torch as T
+    
     if not T.cuda.is_available():
         return "SKIP (no CUDA device)"
     try:
-        from engine import ops_cuda
+        
         if not ops_cuda.AVAILABLE:
             return f"SKIP ({ops_cuda.status()})"
         if "cuda" not in ops.active_impls("paged_decode_attention"):
@@ -435,7 +440,7 @@ def t_cuda_paged_attention():
     except Exception as e:
         return f"SKIP ({type(e).__name__}: {e})"
 
-    from engine.paged_cache import PagedKVCache
+    
     dev, dt = "cuda", T.bfloat16
     n_kv, G, d = 2, 6, 128                      # Qwen2.5-1.5B
     n_q = n_kv * G

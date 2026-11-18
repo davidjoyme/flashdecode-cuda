@@ -5,6 +5,16 @@ import time
 import traceback
 import torch
 import config
+import subprocess
+from testing import smoke
+from engine.cache import ContiguousKVCache
+from engine.loader import load as load_weights
+from engine.model import LlamaEngine
+from testing.diff import report
+from reference.oracle import load
+from engine import ops_cuda
+from engine import ops
+from engine import ops_cuda
 
 def _hdr(n: int, title: str) -> None:
     print(f"\n{'=' * 72}\n[{n}/5] {title}\n{'=' * 72}")
@@ -29,7 +39,7 @@ def check_gpu_clean() -> bool:
     Hours went into increasingly elaborate harness fixes for what was
     contention. Checking first is seconds. Always check first.
     """
-    import subprocess
+
 
     try:
         out = subprocess.run(
@@ -62,7 +72,7 @@ def check_gpu_clean() -> bool:
 # ---------------------------------------------------------------- stage 1
 def stage_smoke() -> tuple[bool, int]:
     _hdr(1, "CPU smoke suite")
-    from testing import smoke
+    
 
     failed = 0
     for fn in smoke.TESTS:
@@ -84,7 +94,7 @@ def stage_smoke() -> tuple[bool, int]:
 def stage_oracle_fresh():
     _hdr(2, "oracle freshness")
     try:
-        from reference.oracle import load
+        
 
         o = load()
     except FileNotFoundError as e:
@@ -112,10 +122,6 @@ def stage_oracle_fresh():
 
 # ---------------------------------------------------------------- stage 3/4
 def stage_diff_and_parity(oracle):
-    from engine.cache import ContiguousKVCache
-    from engine.loader import load as load_weights
-    from engine.model import LlamaEngine
-    from testing.diff import report
 
     cfg, weights = load_weights(oracle["model_id"], config.DEVICE, config.DTYPE)
     if not cfg.qkv_bias:
@@ -154,7 +160,7 @@ def stage_diff_and_parity(oracle):
     # questions cleanly: ref proves the delta/residual restructure is
     # correct, cuda then proves the kernel is.
     try:
-        from engine import ops_cuda
+        
         impls = ("ref", "cuda") if ops_cuda.AVAILABLE else ("ref",)
         if not ops_cuda.AVAILABLE:
             print(f"  [warn] {ops_cuda.status()}  -- validating ref only")
@@ -257,12 +263,12 @@ def _select_impl(name: str, quiet: bool = False) -> str:
     point of the registry -- a half-CUDA model still runs and a correctness
     bug bisects to one kernel.
     """
-    from engine import ops
+    
 
     if name == "ref":
         ops.reset()
         return "reference (pure PyTorch)"
-    from engine import ops_cuda
+    
 
     if not ops_cuda.AVAILABLE:
         if not quiet:

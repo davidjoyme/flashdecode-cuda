@@ -3,6 +3,10 @@ import re
 from typing import Dict, List, Tuple
 import torch
 import config
+from engine.cache import ContiguousKVCache
+from engine.loader import load as load_weights
+from engine.model import LlamaEngine
+from reference.oracle import load as load_oracle
 
 # Relative spacing of bf16: 1 sign + 8 exponent + 7 explicit mantissa bits,
 # so 8 bits of significand precision.
@@ -123,10 +127,7 @@ def _hint(name: str, mine, ref) -> None:
 
 
 def main() -> int:
-    from engine.cache import ContiguousKVCache
-    from engine.loader import load as load_weights
-    from engine.model import LlamaEngine
-    from reference.oracle import load as load_oracle
+
 
     oracle = load_oracle()
     cfg, weights = load_weights(oracle["model_id"], config.DEVICE, config.DTYPE)

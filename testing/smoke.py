@@ -4,6 +4,7 @@ from config import LlamaConfig
 from engine import ops
 from engine.loader import validate
 from engine.model import LlamaEngine
+from engine.cache import ContiguousKVCache
 
 DEV = "cpu"
 DT = torch.float32          # fp32 on CPU: testing logic, not numerics
@@ -151,7 +152,7 @@ def t_decode_attention_ragged():
 
 
 def t_cache_indexing():
-    from engine.cache import ContiguousKVCache
+    
     c = ContiguousKVCache(2, 2, 8, 2, 4, DT, DEV)
     c.append(0, torch.full((2, 2, 4), 1.0), torch.full((2, 2, 4), -1.0))
     c.append(1, torch.full((2, 2, 4), 9.0), torch.full((2, 2, 4), -9.0))

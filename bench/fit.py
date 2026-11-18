@@ -1,7 +1,9 @@
 from __future__ import annotations
 import argparse
 from config import LlamaConfig
-
+import config as C
+from transformers import AutoConfig
+import torch
 
 def weight_bytes(cfg: LlamaConfig, elem: int = 2) -> int:
     hid, d = cfg.hidden_size, cfg.head_dim
@@ -61,8 +63,8 @@ def main() -> None:
     ap.add_argument("--model", default=None)
     args = ap.parse_args()
 
-    import config as C
-    from transformers import AutoConfig
+    
+    
     cfg = LlamaConfig.from_hf(AutoConfig.from_pretrained(args.model or C.MODEL_ID))
     print(cfg.summary(), "\n")
 
@@ -70,7 +72,6 @@ def main() -> None:
         budget = int(args.budget * 1e9)
         print(f"  assuming {args.budget:.1f} GB free\n")
     else:
-        import torch
         if not torch.cuda.is_available():
             print("  no CUDA device; pass --budget to plan offline")
             return

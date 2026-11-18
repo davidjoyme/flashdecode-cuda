@@ -2,10 +2,11 @@ from __future__ import annotations
 import argparse
 import torch
 from engine import ops
+import statistics
+import time
+from engine import ops_cuda
 
 try:
-    from engine import ops_cuda  # noqa: F401  (registers the kernel)
-
     HAVE_CUDA_IMPL = ops_cuda.AVAILABLE
     IMPL_STATUS = ops_cuda.status()
 except Exception as _exc:
@@ -46,8 +47,7 @@ def time_per_launch(fn, iters=200, warmup=50) -> float:
     pure noise. The median is stable and is the number an eager decode loop
     actually experiences.
     """
-    import statistics
-    import time
+
 
     for _ in range(warmup):
         fn()

@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
+import csv as _csv
+import io
 
 # One metric per question. Keeping the list short keeps ncu's replay count
 # low, which matters because ncu replays each kernel once per metric pass.
@@ -120,8 +122,7 @@ def _parse(csv_text: str) -> dict[str, list[float]]:
     at all but do contain commas, so a naive "line contains a comma" filter
     feeds them to the reader and produces garbage rows.
     """
-    import csv as _csv
-    import io
+
 
     lines = csv_text.splitlines()
     # The real CSV starts at the header row, which always names the kernel.

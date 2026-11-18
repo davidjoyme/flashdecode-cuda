@@ -6,9 +6,10 @@ import torch
 import torch.nn.functional as F
 from engine import ops
 from engine.paged_cache import PagedKVCache
+from engine import ops_cuda
+import fd_kernels
 
 try:
-    from engine import ops_cuda
     HAVE_CUDA = ops_cuda.AVAILABLE
     STATUS = ops_cuda.status()
 except Exception as e:                                    # pragma: no cover
@@ -164,7 +165,7 @@ def main() -> int:
     pc, q, kc, vc, table, slens = build_case(4, 128, n_kv, G, d, bs, dev, dt)
     want = ops._REGISTRY["paged_decode_attention"]["ref"](q, pc.k[0], pc.v[0],
                                                           table, slens, d ** -0.5)
-    import fd_kernels
+    
     t32, s32 = table.to(torch.int32), slens.to(torch.int32)
     def call(v, sp=0):
         return fd_kernels.paged_decode_attention(q, pc.k[0], pc.v[0], t32, s32,
@@ -219,7 +220,7 @@ def main() -> int:
             pc, q, kc, vc, table, slens = build_case(B, ctx, n_kv, G, d, bs, dev, dt)
             byts = 2 * B * ctx * n_kv * d * 2
             sol = byts / args.bw / 1e9 * 1e6
-            import fd_kernels
+            
             def run(ver, sp=0):
                 t32, s32 = table.to(torch.int32), slens.to(torch.int32)
                 return lambda: fd_kernels.paged_decode_attention(

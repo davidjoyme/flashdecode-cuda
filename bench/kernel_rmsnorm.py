@@ -108,49 +108,7 @@ def check(B, H, device="cuda", dtype=torch.bfloat16) -> dict:
 
 
 def sweep(H: int, bw: float, sms: int, threads: int) -> None:
-    """Asymptotic bandwidth: how good is the KERNEL BODY?
 
-    MEASUREMENT CORRECTED 2026-10-27. The first version of this reported
-    4829 GB/s against a 1655 GB/s HBM peak -- 292%, i.e. physically
-    impossible. Two separate artifacts, both classics:
-
-    1. L2 RESIDENCY. The timing loop re-read the SAME two buffers 100 times.
-       This card has ~96 MB of L2, so any working set below that was served
-       entirely from cache after the first iteration and the loop measured L2
-       bandwidth (several TB/s), not HBM. Fixed by rotating over enough
-       distinct buffer sets that the total exceeds L2 by ~3x, so nothing is
-       still cached by the time it comes round again.
-
-    2. ALLOCATOR CHURN. At B=16384 the working set finally exceeded L2, but
-       every call also allocated two 50 MB output tensors; 100 iterations of
-       that gave 332 us against a 122 us floor. That was the caching
-       allocator, not bandwidth. Fixed by capturing the whole rotation into
-       one CUDA graph, which uses a private memory pool and takes both the
-       allocator and the dispatch out of the timed region.
-
-    Worth keeping in the writeup: an above-peak bandwidth number is never a
-    fast kernel, it is always a broken benchmark, and the usual cause is a
-    hot cache.
-
-    Why this is a separate measurement. The kernel runs one block per row, so
-    the grid is exactly B blocks. ptxas reports 36 registers and 24 B of smem
-    at THREADS=192, which allows 8 blocks per SM, so the machine does not fill
-    until B >= sms * 8 (1360 on a 170-SM card). Every decode batch size is far
-    below that: at B=128, 42 of 170 SMs get no work at all, and the whole
-    kernel moves 1.5 MB -- less than 1 us of traffic. Under those conditions
-    the measurement is dominated by launch and wave latency, and %SOL says
-    nothing about the quality of the loads.
-
-    Sweeping into the saturated regime separates the two questions:
-      - is the kernel body efficient?        -> this sweep
-      - is it worth optimising for decode?   -> the table above (it is not;
-        there the win is launch count, which fusion already delivered)
-
-    A good memory-bound kernel reaches 80-90% of measured peak here. If this
-    plateaus much lower, the body has a real problem -- look at whether 8
-    bf16 per thread is enough work to keep enough loads in flight, and try
-    2 or 4 vectors per thread.
-    """
     props = torch.cuda.get_device_properties(0)
     l2 = getattr(props, "L2_cache_size", 0) or 96 * 1024 * 1024
     # 6x L2, not 3x. At 3x, B=1360 still reported 143% of peak -- a rotation

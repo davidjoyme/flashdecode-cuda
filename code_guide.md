@@ -252,12 +252,46 @@ does `weight * x32.to(dtype)`, not `(weight * x32).to(dtype)`.
 theoretical occupancy, with the hardware thread limit binding rather than this
 kernel. So register pressure was eliminated as a suspect *before* profiling.
 
-**What the profiler said.** At B=2048 the kernel runs in 14.58 µs against a
-15.21 µs logical-byte floor — 104% of SOL, *faster* than a naive byte count
-allows. The 25% gap between logical and measured DRAM traffic is the **weight
-broadcast**: all 2048 blocks read the whole 3 KB weight vector, which is
-2048 × 1536 × 2 = 6.29 MB of load instructions against a measured gap of
-6.24 MB. L2 serves all but the first.
+**What the profiler said, and the mistake in reading it.** At B=2048 the kernel
+runs in 14.58 µs against a 15.21 µs logical-byte floor, with `dram__bytes.sum`
+at 18.93 MB against 25.17 MB logical. That was first written up as 104% of SOL,
+explained by the weight broadcast — 2048 blocks × 1536 × 2 B = 6.29 MB of
+weight load instructions, against a 6.24 MB measured gap. A 1% match.
+
+**The explanation was wrong, and the error is the better interview story.** The
+SOL model charges the weight *once* (3 KB), which is correct for a byte floor.
+The hardware issues 6.29 MB of weight loads and L2 serves all but the first, so
+DRAM sees ~3 KB. Logical and measured agree on the weights, so the broadcast
+explains nothing — and it could only push measured traffic *above* a logical
+count that charged the weight once, never below. The numbers agreed because
+every quantity here is a multiple of B × H × 2 = 6.29 MB: four tensors of
+identical shape, so one tensor's worth of anything hits the same value and a 1%
+match carries no information.
+
+The real mechanism is **write-back absorption**. Split by direction: reads
+(`x`, `residual`, weight) are 12.59 MB and must come from DRAM; writes (`out`,
+`new_residual`) are 12.58 MB going into 101 MB of L2. Subtracting the read half
+leaves ~6.3 MB of stores counted out of 12.58 MB issued — the kernel retired
+before its own write-back drained, and `dram__bytes` only counts sectors inside
+the kernel window. The duration excludes stores the floor charges in full.
+
+So B=2048 is not a saturated shape at all: 25 MB against 101 MB of L2 is a
+quarter of the cache. The sweep confirms it — measured traffic as a fraction of
+the logical footprint climbs 50% → 55% → 87% → 94% as B goes 2048 → 65536, and
+the SOL reading falls 110% → 144% → 101% → 94%. The artifact destroys itself
+once the working set clears the cache. At B=2048 the aggregate lands on
+12.59 MB against a 12.586 MB logical *read* footprint — 100.03%, stores
+contributing nothing — which is the fingerprint that names the mechanism.
+
+**The real Phase 2 number, B=65536 (8× L2): 94% of the logical byte floor,
+88–94% of measured HBM peak.** The range exists because 6% of traffic is still
+absorbed, so the logical-byte rate (1551 GB/s) and the counted-sector rate
+(1462 GB/s) differ by exactly that much. Both are true; quoting one alone
+overstates or understates.
+
+Worth noting B=8192 reads **144%** of SOL — worse than the original 104%,
+because its working set sits at precisely 1.00× L2, the worst possible case.
+The first write-up had accidentally picked the least misleading bad shape.
 
 At decode shapes it is a different story: **0.09 waves/SM** at B=128, so 42 of
 170 SMs get no work at all, 12% occupancy, and 2.75 of 3.70 µs is pure launch
@@ -265,9 +299,15 @@ latency. Not fixable in the kernel — 128 rows × 1536 elements is 1.6 MB, and
 there is not enough data in a decode step to fill the card at any geometry.
 The levers are launch *count* (fusion) and launch *cost* (graph capture).
 
-> *"Your kernel beat the speed-of-light number. How?"* It did not; the SOL was
-> computed on logical bytes and L2 absorbs the weight re-reads. That is why
-> `dram__bytes.sum` is the metric to trust, not bytes ÷ seconds.
+> *"Your kernel beat the speed-of-light number. How?"* It did not — a kernel
+> cannot move its bytes faster than the memory system allows, so >100% of SOL
+> is always an unequal comparison, and the question is which side is priced
+> wrong. Here the duration paid for ~19 MB while the floor was priced on
+> 25 MB, because half the stores were still sitting in L2 when the kernel
+> retired. The fix is to split DRAM traffic by direction and to size the
+> working set past L2 — and the check that would have caught my first
+> explanation in one step is *does this mechanism push the number in the
+> direction I observed?*
 
 ### `kernels/paged_attention.cu` — paged GQA decode attention (Phase 4)
 Three versions, **all kept compiled** and selectable at runtime, so before and

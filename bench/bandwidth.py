@@ -43,4 +43,3 @@ if __name__ == "__main__":
     for k, v in r.items():
         print(f"{k:<8} {v:8.1f} GB/s")
     print(f"\nUSE THIS as the SOL denominator: {max(r.values()):.1f} GB/s")
-    print("Record it in logs/EXPERIMENTS.md with the device name.")

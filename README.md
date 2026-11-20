@@ -96,11 +96,36 @@ and is never quoted as a speedup.
 36 registers, 0 spills, 24 B smem → 8 blocks/SM, 100% theoretical occupancy, so
 register pressure was eliminated as a suspect before profiling.
 
-Saturated (B=2048), by `ncu`: 14.58 µs against a 15.21 µs logical-byte floor —
-**104% of SOL**, faster than a naive byte count allows, because the 25% gap
-between logical and `dram__bytes.sum` traffic is the weight broadcast (2048
-blocks × 1536 × 2 B = 6.29 MB of load instructions vs a 6.24 MB measured gap)
-and L2 serves all but the first.
+Measured with `ncu` across four working-set sizes, because a single shape
+cannot tell a bandwidth result from a cache artifact:
+
+| B | set MB | ×L2 | dram MB | % of logical | µs | GB/s | % SOL |
+|---|---|---|---|---|---|---|---|
+| 2048 | 25.2 | 0.25 | 12.6 | 50% | 13.85 | 909 | 110% ✗ |
+| 8192 | 100.7 | 1.00 | 55.0 | 55% | 42.25 | 1302 | 144% ✗ |
+| 32768 | 402.7 | 3.99 | 350.0 | 87% | 241.46 | 1450 | 101% ✗ |
+| 65536 | 805.3 | 7.97 | 758.9 | **94%** | 519.13 | 1462 | **94%** ✓ |
+
+**Only the last row is a bandwidth measurement.** Below ~4× L2 the cache
+absorbs write-back that never reaches DRAM inside the kernel window, so the
+duration excludes stores the byte floor charges in full — which is what
+produces the impossible 110% and 144% readings. As the working set grows, the
+measured fraction of the logical footprint climbs 50% → 55% → 87% → 94% and
+the artifact disappears on its own.
+
+At B=2048 the aggregate came in at 12.59 MB against a 12.586 MB logical *read*
+footprint — 100.03%, with the stores contributing **nothing at all**. That
+exact coincidence is what identifies the mechanism.
+
+**Phase 2 result, B=65536 (805 MB, 8× L2, 94% of traffic reaching DRAM):
+94% of the logical byte floor — 1551 GB/s logical-byte rate, 1462 GB/s on
+counted sectors, so 88–94% of measured peak.** The spread between those two
+figures is exactly the 6% still being absorbed, so both are true and the range
+is the honest claim.
+
+An earlier write-up of this row reported 104% of SOL and attributed it to the
+weight broadcast. That was wrong in both the number and the mechanism; the
+diagnosis is in `logs/EXPERIMENTS.md` under *Attempt 4*.
 
 At decode shapes it is the opposite problem: **0.09 waves/SM** at B=128, so 42
 of 170 SMs get no work, and 2.75 of 3.70 µs is pure launch latency. Not fixable
@@ -133,6 +158,7 @@ python -m testing.phase1                  # full gate, contiguous cache
 FD_CACHE=paged python -m testing.phase1   # full gate, paged cache
 
 python -m bench.kernel_paged --bw 1655 --sweep-splits
+python -m bench.profile_rmsnorm --sweep --bw 1655      # ncu, past L2
 python -m bench.profile_paged --batch 128 --ctx 2048   # ncu counters
 ```
 
@@ -163,7 +189,15 @@ are marked unusable. Across two independent runs the flagged rows disagreed by
 - **~20% of measured HBM peak** — latency-bound, with real headroom. `ncu` stall
   analysis on the attention kernel is the next step; the 20% figure is
   wall-clock arithmetic, not a hardware counter.
-- All timings from a contended card; ratios are sound, absolutes provisional.
+- Attention timings are from a contended card; ratios are sound, absolutes
+  provisional. (The Phase 2 ncu sweep above is contention-immune — hardware
+  counters, not wall-clock.)
+- This card exposes no `dram__bytes_{read,write}` counters, so the Phase 2
+  read/write split is derived from the aggregate rather than measured. The
+  derivation is pinned by `--cache-control all` and corroborated by the
+  100.03% read-footprint match at B=2048, but it is an inference.
+- The paged attention kernel has the same latent absorption question and has
+  not been swept this way yet.
 - v2's split count comes from a heuristic targeting 850 resident blocks.
   `--sweep-splits` measures the real optimum at 16–32, so it is not calibrated.
 - Phase 5 (fused RoPE + KV-write, fused SwiGLU) not started.
@@ -176,3 +210,6 @@ are marked unusable. Across two independent runs the flagged rows disagreed by
 
 ---
 
+**`CODE_GUIDE.md`** — what every file does and why each decision was made.
+**`logs/EXPERIMENTS.md`** — the experiment log, including the versions that got
+slower and the measurements that turned out to be wrong.

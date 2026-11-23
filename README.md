@@ -101,10 +101,10 @@ cannot tell a bandwidth result from a cache artifact:
 
 | B | set MB | ×L2 | dram MB | % of logical | µs | GB/s | % SOL |
 |---|---|---|---|---|---|---|---|
-| 2048 | 25.2 | 0.25 | 12.6 | 50% | 13.85 | 909 | 110% ✗ |
-| 8192 | 100.7 | 1.00 | 55.0 | 55% | 42.25 | 1302 | 144% ✗ |
-| 32768 | 402.7 | 3.99 | 350.0 | 87% | 241.46 | 1450 | 101% ✗ |
-| 65536 | 805.3 | 7.97 | 758.9 | **94%** | 519.13 | 1462 | **94%** ✓ |
+| 2048 | 25.2 | 0.25 | 12.6 | 50% | 13.85 | 909 | 110%  |
+| 8192 | 100.7 | 1.00 | 55.0 | 55% | 42.25 | 1302 | 144%  |
+| 32768 | 402.7 | 3.99 | 350.0 | 87% | 241.46 | 1450 | 101%  |
+| 65536 | 805.3 | 7.97 | 758.9 | **94%** | 519.13 | 1462 | **94%**  |
 
 **Only the last row is a bandwidth measurement.** Below ~4× L2 the cache
 absorbs write-back that never reaches DRAM inside the kernel window, so the
@@ -122,7 +122,6 @@ exact coincidence is what identifies the mechanism.
 counted sectors, so 88–94% of measured peak.** The spread between those two
 figures is exactly the 6% still being absorbed, so both are true and the range
 is the honest claim.
-
 
 
 At decode shapes it is the opposite problem: **0.09 waves/SM** at B=128, so 42
@@ -167,13 +166,40 @@ python -m bench.profile_paged --batch 128 --ctx 2048   # ncu counters
 
 ## Measurement discipline
 
-Three successive attempts to measure achieved bandwidth by timing a loop gave
-**292%**, then **143%**, then **38%** of a 1655 GB/s peak. The first two were L2
-residency; the third was the shared GPU, which also made a plain `torch.copy_`
-control read 38% of peak. The resolution was not better arithmetic but a
-different instrument — wall-clock bandwidth cannot separate DRAM traffic from
-L2 traffic, and that distinction *is* the measurement. **An above-peak
-bandwidth number is never a fast kernel; it is always a broken benchmark.**
+Three attempts to measure achieved bandwidth by timing a loop gave **292%**,
+then **143%**, then **38%** of a 1655 GB/s peak. Those are not one error
+shrinking — they are **two independent confounds with opposite signs**, which is
+why no amount of fixing the harness converged.
+
+| | setup | reading | cause |
+|---|---|---|---|
+| 1 | one buffer, reused | 4829 GB/s = **292%** | fully L2-resident |
+| 2 | rotate over 3× L2 | 2374 GB/s = **143%** | ~46% still L2-resident |
+| 3 | rotate 6× L2 + graph | `copy_` control **38%** | GPU shared with other users |
+
+Attempt 1 measured L2 faithfully and divided by an HBM denominator — L2 read
+bandwidth here is ~4800 GB/s, so 292% is arithmetically exactly right and
+answering the wrong question. Attempt 2's rotation genuinely reduced residency
+but could not eliminate it, and partial residency is indistinguishable from a
+working harness: since time is additive, mixed residency combines harmonically
+as `1/B_eff = f/B_L2 + (1−f)/B_HBM`, and f = 0.46 reproduces 143% exactly.
+
+Attempt 3 is the one that mattered, because **caches can only inflate.** A
+plain `torch.copy_` cannot read at 38% of its own peak through any cache
+effect, so the cause had to be external — other processes taking bandwidth.
+
+That combination is unfixable by arithmetic: cache inflates, contention
+deflates, and wall-clock time is a single observable. 143% is equally
+consistent with f = 0.46 on a quiet card or f = 0.7 with contention clawing it
+back. One equation, two unknowns — and attempt 3's spread of 57/78/64% across
+three shapes that should have been identical is what that looks like in
+practice.
+
+So the resolution was a different instrument, not better arithmetic.
+`dram__bytes.sum` **counts** the DRAM sectors a kernel moved rather than
+inferring them from elapsed time, so cache hits never enter the number at all.
+**An above-peak bandwidth figure is never a fast kernel; it is always a broken
+benchmark** — and a below-peak one on a pure stream is never a slow kernel.
 
 Timings are best-of-5 minima (contention is strictly additive, so the minimum
 is the least-polluted sample) with per-row trial spread reported; rows above 15%
@@ -188,8 +214,12 @@ are marked unusable. Across two independent runs the flagged rows disagreed by
   analysis on the attention kernel is the next step; the 20% figure is
   wall-clock arithmetic, not a hardware counter.
 - Attention timings are from a contended card; ratios are sound, absolutes
-  provisional. (The Phase 2 ncu sweep above is contention-immune — hardware
-  counters, not wall-clock.)
+  provisional. The Phase 2 ncu sweep is only *partly* insulated: the byte
+  counts are contention-immune, since another process cannot change how many
+  sectors this kernel moves, but `ncu` still reports a duration and contention
+  inflates it. So the `dram MB` and `% logical` columns are solid while the
+  µs / GB/s / %SOL columns are not — they understate, making **94% of SOL a
+  floor rather than a ceiling**.
 - This card exposes no `dram__bytes_{read,write}` counters, so the Phase 2
   read/write split is derived from the aggregate rather than measured. The
   derivation is pinned by `--cache-control all` and corroborated by the

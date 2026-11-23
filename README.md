@@ -123,9 +123,7 @@ counted sectors, so 88–94% of measured peak.** The spread between those two
 figures is exactly the 6% still being absorbed, so both are true and the range
 is the honest claim.
 
-An earlier write-up of this row reported 104% of SOL and attributed it to the
-weight broadcast. That was wrong in both the number and the mechanism; the
-diagnosis is in `logs/EXPERIMENTS.md` under *Attempt 4*.
+
 
 At decode shapes it is the opposite problem: **0.09 waves/SM** at B=128, so 42
 of 170 SMs get no work, and 2.75 of 3.70 µs is pure launch latency. Not fixable
@@ -209,7 +207,3 @@ are marked unusable. Across two independent runs the flagged rows disagreed by
   128 and GQA groups {1,2,3,4,6,8}.
 
 ---
-
-**`CODE_GUIDE.md`** — what every file does and why each decision was made.
-**`logs/EXPERIMENTS.md`** — the experiment log, including the versions that got
-slower and the measurements that turned out to be wrong.

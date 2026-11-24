@@ -71,20 +71,99 @@ split-KV with a combine pass (Flash-Decoding). All 44–48 registers, 0 spills.
 
 One call, one layer, ctx=2048, block_size=16:
 
-| B | KV MB | MB/L2 | v0 µs | v1 µs | v2 µs | SDPA µs | **v2 vs SDPA** | GB/s |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 2.1 | 0.02 | 3265 | 1278 | 23.0 | 403 | 17.5× | 91 |
-| 8 | 16.8 | 0.17 | 3673 | 1474 | 25.1 | 345 | 13.8× | 669 |
-| 32 | 67.1 | 0.66 | 3689 | 1469 | 52.9 | 1487 | 28.1× | 1268 |
-| 64 | 134.2 | **1.33** | 4485 | 1719 | 406.9 | 2510 | **6.17×** | 330 |
-| 128 | 268.4 | **2.66** | 4451 | 2524 | 792.4 | 5343 | **6.74×** | 339 |
+| B | KV MB | MB/L2 | v0 µs | v1 µs | v2 µs | SDPA µs | **v2 vs SDPA** |
+|---|---|---|---|---|---|---|---|
+| 1 | 2.1 | 0.02 | 3265 | 1278 | 23.0 | 403 | 17.5× |
+| 8 | 16.8 | 0.17 | 3673 | 1474 | 25.1 | 345 | 13.8× |
+| 32 | 67.1 | 0.66 | 3689 | 1469 | 52.9 | 1487 | 28.1× |
+| 64 | 134.2 | **1.33** | 4485 | 1719 | 406.9 | 2510 | **6.17×** |
+| 128 | 268.4 | **2.66** | 4451 | 2524 | 792.4 | 5343 | **6.74×** |
 
-**Read the MB/L2 column before the GB/s column.** Below B=64 the working set is
-L2-resident, so the apparent 1268 GB/s at B=32 is L2 bandwidth, not HBM. Past
-L2 it settles at ~330 GB/s — **20% of measured peak, so the kernel is still
-latency-bound, not bandwidth-bound.** The defensible rows are B=64 and B=128.
-Speedups hold at every batch size, since both kernels read the same data
-through the same cache; only absolute bandwidth is inflated.
+Each ratio is a fair comparison *at its own shape* — both kernels saw identical
+data under identical cache conditions. They are **not comparable across the L2
+boundary**, though. One sequence at ctx 2048 holds 2.10 MB of KV, so L2 (96 MiB)
+is **exactly 48 sequences**, and crossing it (B=32 → 64, data 2×) costs v2 7.7×
+while costing SDPA only 1.7×. v2 gains far more from cache residency, so the
+sub-L2 ratios of 13–28× do not transfer. **6.2–6.7× is the figure to quote**,
+because that is the DRAM-resident regime deployment actually runs in: in the
+engine ~3 GB of weights stream past per decode step and flush L2 roughly 31
+times over, so KV always comes from DRAM.
+
+#### Hardware counters (`profile_paged.py --sweep`)
+
+Wall-clock bandwidth is not quoted here at all; these are `dram__bytes.sum`
+figures with caches flushed before each launch:
+
+| B | logical MB | ×L2 | dram MB | % logical | µs | µs/MB | % peak |
+|---|---|---|---|---|---|---|---|
+| 32 | 67.3 | 0.67 | 69.9 | 104% | 91.8 | 1.364 | 44% |
+| 64 | 134.6 | 1.34 | 141.7 | 105% | 229.7 | 1.706 | 35% |
+| 128 | 269.2 | 2.67 | 276.9 | 103% | 498.6 | 1.852 | 33% |
+| 256 | 538.4 | 5.35 | 546.9 | 102% | 986.9 | 1.833 | 33% |
+| 384 | 807.7 | 8.02 | 819.9 | 102% | 1014.3 | **1.256** | **48%** |
+
+`% peak` prices the duration against the **compulsory** bytes, not against
+measured traffic. That distinction turned out to matter — see the split sweep
+below.
+
+**The GQA reuse is now measured, not asserted.** Traffic sits at 102–105% of
+the GQA-aware prediction at every shape. Had the kernel been re-reading KV per
+query head it would read ~1200% — so each KV head is provably read once and
+reused across its group of 6 in registers. The 2–5% overage is v2's `(m, l,
+acc)` split scratch, which the logical count deliberately excludes.
+
+**No cache absorption here, and for a structural reason.** Measured traffic
+*exceeds* the footprint at every shape, including 0.67× L2, so nothing is
+hiding in cache — unlike Phase 2's rmsnorm, where half the traffic is stores
+and up to 50% went unaccounted. Attention output is 0.39 MB against 268 MB of
+KV reads, **0.15% of traffic**. Write-back absorption needs writes to absorb,
+and there essentially are none. An earlier draft of this section predicted the
+Phase 2 problem would recur here; it does not, and the write fraction is why.
+
+**Bandwidth: 33–48% of measured peak, latency-bound.** Every utilisation metric
+is low at once — DRAM throughput 30–41%, SM throughput 18–30%, achieved
+occupancy 49–69%, **waves/SM 0.71–2.03** — so nothing is saturated anywhere and
+there is real headroom. This replaces an earlier claim of ~330 GB/s / 20% of
+peak, which came from contended wall-clock timings; `ncu` durations are 1.6–1.8×
+shorter at B=64 and B=128, so contention had been *understating* throughput.
+
+**The open finding: µs/MB varies 1.47× across shapes** — 1.852 at B=128, 1.833
+at B=256, then **1.256 at B=384**. A bandwidth-bound kernel would be near-flat,
+so that spread is itself the result. B=384 reproduced to **0.2%** across two
+sessions (1014.26 → 1016.04 µs), so it is not contention, and the split sweep
+below rules out the split count. Cause unknown; `ncu --set full` stall reasons
+at B=256 vs B=384 is the next instrument.
+
+#### Split sweep — why "GB/s" needs the right denominator
+
+Seven runs at B=384 in one session, so cross-session contention is excluded by
+construction:
+
+| splits | dram MB | % logical | overhead | µs | task | moved |
+|---|---|---|---|---|---|---|
+| auto | 820.8 | 102% | +7 MB | 1016.0 | 48% | 49% |
+| 1 | 813.8 | 101% | — | 1032.0 | 47% | 48% |
+| 4 | 832.8 | 103% | +19 MB | 1016.6 | 48% | 50% |
+| 16 | 882.1 | 109% | +68 MB | 959.6 | 51% | 56% |
+| 32 | 953.7 | 118% | **+140 MB** | 978.7 | 50% | **59%** |
+
+**Duration is flat (1032 → 960 µs, 8%) while traffic grows 18%.** The extra
+bytes are v2's `(m, l, acc)` scratch, which scales linearly in the split count:
+predicted deltas of 4.8 / 14.4 / 33.5 / 71.9 / 148.6 MB against measured
+6.0 / 19.0 / 39.4 / 68.3 / 139.9 MB.
+
+So a rate computed against *measured* traffic climbs 789 → 974 GB/s (48% → 59%)
+purely because the kernel moves more bytes for identical work. **Efficiency must
+be priced against the compulsory bytes.** Measured traffic is a model check —
+below 100% means cache absorbed some, above means overhead — never the
+efficiency denominator. Phase 2 needed the opposite correction (bytes that
+should have moved and didn't), which is why both tables now report the task
+rate and keep measured traffic as a diagnostic.
+
+Secondary result: splits=16 is 1.06× faster for +7% traffic, so the heuristic
+picking ~1–2 here is trading a little latency for less traffic — defensible,
+not miscalibrated. `kernel_paged --sweep-splits` had called it miscalibrated on
+wall-clock alone, blind to the scratch cost.
 
 Baseline is `F.scaled_dot_product_attention` with `enable_gqa=True`, so it pays
 no `repeat_interleave` expansion and reads exactly the same byte count — a pure
@@ -210,9 +289,17 @@ are marked unusable. Across two independent runs the flagged rows disagreed by
 
 ## Open work
 
-- **~20% of measured HBM peak** — latency-bound, with real headroom. `ncu` stall
-  analysis on the attention kernel is the next step; the 20% figure is
-  wall-clock arithmetic, not a hardware counter.
+- **33–48% of measured HBM peak** — latency-bound (waves/SM 0.71–2.03, so the
+  card is barely filled once at most shapes), with real headroom. `ncu --set
+  full` stall reasons are the next instrument.
+- **µs/MB varies 1.47× across shapes and nothing explains it yet.** Not
+  contention (B=384 reproduced to 0.2%), not the split count (duration flat
+  across seven pinned values). This is the most interesting open question in
+  the project.
+- v2's split count heuristic targets 850 resident blocks. At B=384 that picks
+  ~1–2 splits, which costs 6% latency but saves 7% traffic — a reasonable
+  trade, so the earlier "miscalibrated" verdict is withdrawn for this shape.
+  Whether it holds at small B is untested.
 - Attention timings are from a contended card; ratios are sound, absolutes
   provisional. The Phase 2 ncu sweep is only *partly* insulated: the byte
   counts are contention-immune, since another process cannot change how many
